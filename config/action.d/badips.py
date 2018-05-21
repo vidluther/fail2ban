@@ -21,7 +21,6 @@ import sys
 if sys.version_info < (2, 7):
 	raise ImportError("badips.py action requires Python >= 2.7")
 import json
-from functools import partial
 import threading
 import logging
 if sys.version_info >= (3, ):
@@ -33,7 +32,7 @@ else:
 	from urllib import urlencode
 
 from fail2ban.server.actions import ActionBase
-from fail2ban.version import version as f2bVersion
+
 
 class BadIPsAction(ActionBase):
 	"""Fail2Ban action which reports bans to badips.com, and also
@@ -71,6 +70,9 @@ class BadIPsAction(ActionBase):
 	updateperiod : int, optional
 		Time in seconds between updating bad IPs blacklist.
 		Default 900 (15 minutes)
+	agent : str, optional
+		User agent transmitted to server.
+		Default `Fail2Ban/ver.`
 
 	Raises
 	------
@@ -78,14 +80,18 @@ class BadIPsAction(ActionBase):
 		If invalid `category`, `score`, `banaction` or `updateperiod`.
 	"""
 
+	TIMEOUT = 10
 	_badips = "http://www.badips.com"
-	_Request = partial(
-		Request, headers={'User-Agent': "Fail2Ban %s" % f2bVersion})
+	def _Request(self, url, **argv):
+		return Request(url, headers={'User-Agent': self.agent}, **argv)
 
 	def __init__(self, jail, name, category, score=3, age="24h", key=None,
-		banaction=None, bancategory=None, bankey=None, updateperiod=900):
+		banaction=None, bancategory=None, bankey=None, updateperiod=900, agent="Fail2Ban", 
+		timeout=TIMEOUT):
 		super(BadIPsAction, self).__init__(jail, name)
 
+		self.timeout = timeout
+		self.agent = agent
 		self.category = category
 		self.score = score
 		self.age = age
@@ -111,10 +117,12 @@ class BadIPsAction(ActionBase):
 		------
 		HTTPError
 			Any issues with badips.com request.
+		ValueError
+			If badips.com response didn't contain necessary information
 		"""
 		try:
 			response = urlopen(
-				self._Request("/".join([self._badips, "get", "categories"])))
+				self._Request("/".join([self._badips, "get", "categories"])), timeout=self.timeout)
 		except HTTPError as response:
 			messages = json.loads(response.read().decode('utf-8'))
 			self._logSys.error(
@@ -122,7 +130,13 @@ class BadIPsAction(ActionBase):
 				messages['err'])
 			raise
 		else:
-			categories = json.loads(response.read().decode('utf-8'))['categories']
+			response_json = json.loads(response.read().decode('utf-8'))
+			if not 'categories' in response_json:
+				err = "badips.com response lacked categories specification. Response was: %s" \
+				  % (response_json,)
+				self._logSys.error(err)
+				raise ValueError(err)
+			categories = response_json['categories']
 			categories_names = set(
 				value['Name'] for value in categories)
 			if incParents:
@@ -162,7 +176,7 @@ class BadIPsAction(ActionBase):
 				urlencode({'age': age})])
 			if key:
 				url = "&".join([url, urlencode({'key': key})])
-			response = urlopen(self._Request(url))
+			response = urlopen(self._Request(url), timeout=self.timeout)
 		except HTTPError as response:
 			messages = json.loads(response.read().decode('utf-8'))
 			self._logSys.error(
@@ -347,7 +361,7 @@ class BadIPsAction(ActionBase):
 			url = "/".join([self._badips, "add", self.category, aInfo['ip']])
 			if self.key:
 				url = "?".join([url, urlencode({'key': self.key})])
-			response = urlopen(self._Request(url))
+			response = urlopen(self._Request(url), timeout=self.timeout)
 		except HTTPError as response:
 			messages = json.loads(response.read().decode('utf-8'))
 			self._logSys.error(

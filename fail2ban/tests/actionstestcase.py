@@ -35,6 +35,7 @@ from .utils import LogCaptureTestCase
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
 
+
 class ExecuteActions(LogCaptureTestCase):
 
 	def setUp(self):
@@ -64,18 +65,17 @@ class ExecuteActions(LogCaptureTestCase):
 	def testActionsManipulation(self):
 		self.__actions.add('test')
 		self.assertTrue(self.__actions['test'])
-		self.assertTrue('test' in self.__actions)
-		self.assertFalse('nonexistant action' in self.__actions)
+		self.assertIn('test', self.__actions)
+		self.assertNotIn('nonexistant action', self.__actions)
 		self.__actions.add('test1')
 		del self.__actions['test']
 		del self.__actions['test1']
-		self.assertFalse('test' in self.__actions)
+		self.assertNotIn('test', self.__actions)
 		self.assertEqual(len(self.__actions), 0)
 
 		self.__actions.setBanTime(127)
 		self.assertEqual(self.__actions.getBanTime(),127)
 		self.assertRaises(ValueError, self.__actions.removeBannedIP, '127.0.0.1')
-
 
 	def testActionsOutput(self):
 		self.defaultActions()
@@ -86,24 +86,23 @@ class ExecuteActions(LogCaptureTestCase):
 
 		self.__actions.stop()
 		self.__actions.join()
-		self.assertEqual(self.__actions.status,[("Currently banned", 0 ),
+		self.assertEqual(self.__actions.status(),[("Currently banned", 0 ),
                ("Total banned", 0 ), ("Banned IP list", [] )])
-
 
 	def testAddActionPython(self):
 		self.__actions.add(
 			"Action", os.path.join(TEST_FILES_DIR, "action.d/action.py"),
 			{'opt1': 'value'})
 
-		self.assertTrue(self._is_logged("TestAction initialised"))
+		self.assertLogged("TestAction initialised")
 
 		self.__actions.start()
 		time.sleep(3)
-		self.assertTrue(self._is_logged("TestAction action start"))
+		self.assertLogged("TestAction action start")
 
 		self.__actions.stop()
 		self.__actions.join()
-		self.assertTrue(self._is_logged("TestAction action stop"))
+		self.assertLogged("TestAction action stop")
 
 		self.assertRaises(IOError,
 			self.__actions.add, "Action3", "/does/not/exist.py", {})
@@ -137,10 +136,10 @@ class ExecuteActions(LogCaptureTestCase):
 			{})
 		self.__actions.start()
 		time.sleep(3)
-		self.assertTrue(self._is_logged("Failed to start"))
+		self.assertLogged("Failed to start")
 		self.__actions.stop()
 		self.__actions.join()
-		self.assertTrue(self._is_logged("Failed to stop"))
+		self.assertLogged("Failed to stop")
 
 	def testBanActionsAInfo(self):
 		# Action which deletes IP address from aInfo
@@ -156,13 +155,13 @@ class ExecuteActions(LogCaptureTestCase):
 		self.__actions._Actions__checkBan()
 		# Will fail if modification of aInfo from first action propagates
 		# to second action, as both delete same key
-		self.assertFalse(self._is_logged("Failed to execute ban"))
-		self.assertTrue(self._is_logged("action1 ban deleted aInfo IP"))
-		self.assertTrue(self._is_logged("action2 ban deleted aInfo IP"))
+		self.assertNotLogged("Failed to execute ban")
+		self.assertLogged("action1 ban deleted aInfo IP")
+		self.assertLogged("action2 ban deleted aInfo IP")
 
 		self.__actions._Actions__flushBan()
 		# Will fail if modification of aInfo from first action propagates
 		# to second action, as both delete same key
-		self.assertFalse(self._is_logged("Failed to execute unban"))
-		self.assertTrue(self._is_logged("action1 unban deleted aInfo IP"))
-		self.assertTrue(self._is_logged("action2 unban deleted aInfo IP"))
+		self.assertNotLogged("Failed to execute unban")
+		self.assertLogged("action1 unban deleted aInfo IP")
+		self.assertLogged("action2 unban deleted aInfo IP")

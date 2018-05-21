@@ -64,7 +64,7 @@ class DateTemplate(object):
 	def getRegex(self):
 		return self._regex
 
-	def setRegex(self, regex, wordBegin=True):
+	def setRegex(self, regex, wordBegin=True, wordEnd=True):
 		"""Sets regex to use for searching for date in log line.
 
 		Parameters
@@ -72,8 +72,12 @@ class DateTemplate(object):
 		regex : str
 			The regex the template will use for searching for a date.
 		wordBegin : bool
-			Defines whether the regex should be modified to search at
-			beginning of a word, by adding "\\b" to start of regex.
+			Defines whether the regex should be modified to search at beginning of a
+			word, by adding special boundary r'(?=^|\b|\W)' to start of regex.
+			Default True.
+		wordEnd : bool
+			Defines whether the regex should be modified to search at end of a word,
+			by adding special boundary r'(?=\b|\W|$)' to end of regex.
 			Default True.
 
 		Raises
@@ -82,8 +86,10 @@ class DateTemplate(object):
 			If regular expression fails to compile
 		"""
 		regex = regex.strip()
-		if (wordBegin and not re.search(r'^\^', regex)):
-			regex = r'\b' + regex
+		if wordBegin and not re.search(r'^\^', regex):
+			regex = r'(?=^|\b|\W)' + regex
+		if wordEnd and not re.search(r'\$$', regex):
+			regex += r'(?=\b|\W|$)'
 		self._regex = regex
 		self._cRegex = re.compile(regex, re.UNICODE | re.IGNORECASE)
 
@@ -132,7 +138,7 @@ class DateEpoch(DateTemplate):
 
 	def __init__(self):
 		DateTemplate.__init__(self)
-		self.regex = "(?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=audit\()))\d{10}(?:\.\d{3,6})?(?(selinux)(?=:\d+\))(?(square)(?=\])))"
+		self.regex = r"(?:^|(?P<square>(?<=^\[))|(?P<selinux>(?<=audit\()))\d{10,11}\b(?:\.\d{3,6})?(?:(?(selinux)(?=:\d+\)))|(?(square)(?=\])))"
 
 	def getDate(self, line):
 		"""Method to return the date for a log line.
@@ -153,6 +159,7 @@ class DateEpoch(DateTemplate):
 			# extract part of format which represents seconds since epoch
 			return (float(dateMatch.group()), dateMatch)
 		return None
+
 
 class DatePatternRegex(DateTemplate):
 	"""Date template, with regex/pattern
@@ -235,6 +242,7 @@ class DatePatternRegex(DateTemplate):
 				for key, value in dateMatch.groupdict().iteritems()
 				if value is not None)
 			return reGroupDictStrptime(groupdict), dateMatch
+
 
 class DateTai64n(DateTemplate):
 	"""A date template which matches TAI64N formate timestamps.

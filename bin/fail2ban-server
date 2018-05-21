@@ -22,7 +22,9 @@ __author__ = "Cyril Jaquier"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier"
 __license__ = "GPL"
 
-import getopt, sys, os
+import getopt
+import os
+import sys
 
 from fail2ban.version import version
 from fail2ban.server.server import Server
@@ -125,7 +127,7 @@ class Fail2banServer:
 								self.__conf["pidfile"],
 								self.__conf["force"])
 			return True
-		except Exception, e:
+		except Exception as e:
 			logSys.exception(e)
 			self.__server.quit()
 			return False

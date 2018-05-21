@@ -24,9 +24,10 @@ __author__ = "Cyril Jaquier"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier"
 __license__ = "GPL"
 
-import time, logging
+import logging
 import os
 import sys
+import time
 if sys.version_info >= (3, 3):
 	import importlib.machinery
 else:
@@ -45,6 +46,7 @@ from ..helpers import getLogger
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
+
 
 class Actions(JailThread, Mapping):
 	"""Handles jail actions.
@@ -192,13 +194,14 @@ class Actions(JailThread, Mapping):
 		ValueError
 			If `ip` is not banned
 		"""
+		# Always delete ip from database (also if currently not banned)
+		if self._jail.database is not None:
+			self._jail.database.delBan(self._jail, ip)
 		# Find the ticket with the IP.
 		ticket = self.__banManager.getTicketByIP(ip)
 		if ticket is not None:
 			# Unban the IP.
 			self.__unBan(ticket)
-			if self._jail.database is not None:
-				self._jail.database.delBan(self._jail, ticket)
 		else:
 			raise ValueError("IP %s is not banned" % ip)
 
@@ -243,6 +246,45 @@ class Actions(JailThread, Mapping):
 		logSys.debug(self._jail.name + ": action terminated")
 		return True
 
+	def __getBansMerged(self, mi, overalljails=False):
+		"""Gets bans merged once, a helper for lambda(s), prevents stop of executing action by any exception inside.
+
+		This function never returns None for ainfo lambdas - always a ticket (merged or single one)
+		and prevents any errors through merging (to guarantee ban actions will be executed).
+		[TODO] move merging to observer - here we could wait for merge and read already merged info from a database
+
+		Parameters
+		----------
+		mi : dict
+			merge info, initial for lambda should contains {ip, ticket}
+		overalljails : bool
+			switch to get a merged bans :
+			False - (default) bans merged for current jail only
+			True - bans merged for all jails of current ip address
+
+		Returns
+		-------
+		BanTicket 
+			merged or self ticket only
+		"""
+		idx = 'all' if overalljails else 'jail'
+		if idx in mi:
+			return mi[idx] if mi[idx] is not None else mi['ticket']
+		try:
+			jail=self._jail
+			ip=mi['ip']
+			mi[idx] = None
+			if overalljails:
+				mi[idx] = jail.database.getBansMerged(ip=ip)
+			else:
+				mi[idx] = jail.database.getBansMerged(ip=ip, jail=jail)
+		except Exception as e:
+			logSys.error(
+				"Failed to get %s bans merged, jail '%s': %s",
+				idx, jail.name, e,
+				exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
+		return mi[idx] if mi[idx] is not None else mi['ticket']
+
 	def __checkBan(self):
 		"""Check for IP address to ban.
 
@@ -255,7 +297,7 @@ class Actions(JailThread, Mapping):
 			True if an IP address get banned.
 		"""
 		ticket = self._jail.getFailTicket()
-		if ticket != False:
+		if ticket:
 			aInfo = CallingMap()
 			bTicket = BanManager.createBanTicket(ticket)
 			ip = bTicket.getIP()
@@ -264,14 +306,12 @@ class Actions(JailThread, Mapping):
 			aInfo["time"] = bTicket.getTime()
 			aInfo["matches"] = "\n".join(bTicket.getMatches())
 			if self._jail.database is not None:
-				aInfo["ipmatches"] = lambda jail=self._jail: "\n".join(
-					jail.database.getBansMerged(ip=ip).getMatches())
-				aInfo["ipjailmatches"] = lambda jail=self._jail: "\n".join(
-					jail.database.getBansMerged(ip=ip, jail=jail).getMatches())
-				aInfo["ipfailures"] = lambda jail=self._jail: \
-					jail.database.getBansMerged(ip=ip).getAttempt()
-				aInfo["ipjailfailures"] = lambda jail=self._jail: \
-					jail.database.getBansMerged(ip=ip, jail=jail).getAttempt()
+				mi4ip = lambda overalljails=False, self=self, \
+					mi={'ip':ip, 'ticket':bTicket}: self.__getBansMerged(mi, overalljails)
+				aInfo["ipmatches"]      = lambda: "\n".join(mi4ip(True).getMatches())
+				aInfo["ipjailmatches"]  = lambda: "\n".join(mi4ip().getMatches())
+				aInfo["ipfailures"]     = lambda: mi4ip(True).getAttempt()
+				aInfo["ipjailfailures"] = lambda: mi4ip().getAttempt()
 			if self.__banManager.addBanTicket(bTicket):
 				logSys.notice("[%s] Ban %s" % (self._jail.name, aInfo["ip"]))
 				for name, action in self._actions.iteritems():
@@ -333,11 +373,21 @@ class Actions(JailThread, Mapping):
 					self._jail.name, name, aInfo, e,
 					exc_info=logSys.getEffectiveLevel()<=logging.DEBUG)
 
-	@property
-	def status(self):
-		"""Status of active bans, and total ban counts.
+	def status(self, flavor="basic"):
+		"""Status of current and total ban counts and current banned IP list.
 		"""
-		ret = [("Currently banned", self.__banManager.size()), 
+		# TODO: Allow this list to be printed as 'status' output
+		supported_flavors = ["basic", "cymru"]
+		if flavor is None or flavor not in supported_flavors:
+			logSys.warning("Unsupported extended jail status flavor %r. Supported: %s" % (flavor, supported_flavors))
+		# Always print this information (basic)
+		ret = [("Currently banned", self.__banManager.size()),
 			   ("Total banned", self.__banManager.getBanTotal()),
 			   ("Banned IP list", self.__banManager.getBanList())]
+		if flavor == "cymru":
+			cymru_info = self.__banManager.getBanListExtendedCymruInfo()
+			ret += \
+				[("Banned ASN list", self.__banManager.geBanListExtendedASN(cymru_info)),
+				 ("Banned Country list", self.__banManager.geBanListExtendedCountry(cymru_info)),
+				 ("Banned RIR list", self.__banManager.geBanListExtendedRIR(cymru_info))]
 		return ret

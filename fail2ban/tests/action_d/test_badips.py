@@ -22,11 +22,7 @@ import unittest
 import sys
 
 from ..dummyjail import DummyJail
-
-if os.path.exists('config/fail2ban.conf'):
-	CONFIG_DIR = "config"
-else:
-	CONFIG_DIR='/etc/fail2ban'
+from ..utils import CONFIG_DIR
 
 if sys.version_info >= (2,7):
 	class BadIPsActionTest(unittest.TestCase):
@@ -41,6 +37,7 @@ if sys.version_info >= (2,7):
 			self.jail.actions.add("badips", pythonModule, initOpts={
 				'category': "ssh",
 				'banaction': "test",
+				'timeout': 30,
 				})
 			self.action = self.jail.actions["badips"]
 
@@ -52,7 +49,7 @@ if sys.version_info >= (2,7):
 
 		def testCategory(self):
 			categories = self.action.getCategories()
-			self.assertTrue("ssh" in categories)
+			self.assertIn("ssh", categories)
 			self.assertTrue(len(categories) >= 10)
 
 			self.assertRaises(

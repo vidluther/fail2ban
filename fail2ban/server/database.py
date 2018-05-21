@@ -21,13 +21,14 @@ __author__ = "Steven Hiscocks"
 __copyright__ = "Copyright (c) 2013 Steven Hiscocks"
 __license__ = "GPL"
 
-import sys
-import shutil, time
-import sqlite3
 import json
 import locale
+import shutil
+import sqlite3
+import sys
+import time
 from functools import wraps
-from threading import Lock
+from threading import RLock
 
 from .mytime import MyTime
 from .ticket import FailTicket
@@ -37,17 +38,55 @@ from ..helpers import getLogger
 logSys = getLogger(__name__)
 
 if sys.version_info >= (3,):
-	sqlite3.register_adapter(
-		dict,
-		lambda x: json.dumps(x, ensure_ascii=False).encode(
-			locale.getpreferredencoding(), 'replace'))
-	sqlite3.register_converter(
-		"JSON",
-		lambda x: json.loads(x.decode(
-			locale.getpreferredencoding(), 'replace')))
+	def _json_dumps_safe(x):
+		try:
+			x = json.dumps(x, ensure_ascii=False).encode(
+				locale.getpreferredencoding(), 'replace')
+		except Exception as e: # pragma: no cover
+			logSys.error('json dumps failed: %s', e)
+			x = '{}'
+		return x
+
+	def _json_loads_safe(x):
+		try:
+			x = json.loads(x.decode(
+				locale.getpreferredencoding(), 'replace'))
+		except Exception as e: # pragma: no cover
+			logSys.error('json loads failed: %s', e)
+			x = {}
+		return x
 else:
-	sqlite3.register_adapter(dict, json.dumps)
-	sqlite3.register_converter("JSON", json.loads)
+	def _normalize(x):
+		if isinstance(x, dict):
+			return dict((_normalize(k), _normalize(v)) for k, v in x.iteritems())
+		elif isinstance(x, list):
+			return [_normalize(element) for element in x]
+		elif isinstance(x, unicode):
+			return x.encode(locale.getpreferredencoding())
+		else:
+			return x
+
+	def _json_dumps_safe(x):
+		try:
+			x = json.dumps(_normalize(x), ensure_ascii=False).decode(
+				locale.getpreferredencoding(), 'replace')
+		except Exception as e: # pragma: no cover
+			logSys.error('json dumps failed: %s', e)
+			x = '{}'
+		return x
+
+	def _json_loads_safe(x):
+		try:
+			x = _normalize(json.loads(x.decode(
+				locale.getpreferredencoding(), 'replace')))
+		except Exception as e: # pragma: no cover
+			logSys.error('json loads failed: %s', e)
+			x = {}
+		return x
+
+sqlite3.register_adapter(dict, _json_dumps_safe)
+sqlite3.register_converter("JSON", _json_loads_safe)
+
 
 def commitandrollback(f):
 	@wraps(f)
@@ -56,6 +95,7 @@ def commitandrollback(f):
 			with self._db: # Auto commit and rollback on exception
 				return f(self, self._db.cursor(), *args, **kwargs)
 	return wrapper
+
 
 class Fail2BanDb(object):
 	"""Fail2Ban database for storing persistent data.
@@ -121,9 +161,10 @@ class Fail2BanDb(object):
 			"CREATE INDEX bans_jail_ip ON bans(jail, ip);" \
 			"CREATE INDEX bans_ip ON bans(ip);" \
 
+
 	def __init__(self, filename, purgeAge=24*60*60):
 		try:
-			self._lock = Lock()
+			self._lock = RLock()
 			self._db = sqlite3.connect(
 				filename, check_same_thread=False,
 				detect_types=sqlite3.PARSE_DECLTYPES)
@@ -134,14 +175,29 @@ class Fail2BanDb(object):
 
 			logSys.info(
 				"Connected to fail2ban persistent database '%s'", filename)
-		except sqlite3.OperationalError, e:
+		except sqlite3.OperationalError as e:
 			logSys.error(
 				"Error connecting to fail2ban persistent database '%s': %s",
 				filename, e.args[0])
 			raise
 
+		# differentiate pypy: switch journal mode later (save it during the upgrade), 
+		# to prevent errors like "database table is locked":
+		try:
+			import __pypy__
+			pypy = True
+		except ImportError:
+			pypy = False
+
 		cur = self._db.cursor()
-		cur.execute("PRAGMA foreign_keys = ON;")
+		cur.execute("PRAGMA foreign_keys = ON")
+		# speedup: write data through OS without syncing (no wait):
+		cur.execute("PRAGMA synchronous = OFF")
+		# speedup: transaction log in memory, alternate using OFF (disable, rollback will be impossible):
+		if not pypy:
+			cur.execute("PRAGMA journal_mode = MEMORY")
+		# speedup: temporary tables and indices are kept in memory:
+		cur.execute("PRAGMA temp_store = MEMORY")
 
 		try:
 			cur.execute("SELECT version FROM fail2banDb LIMIT 1")
@@ -161,6 +217,9 @@ class Fail2BanDb(object):
 						Fail2BanDb.__version__, version, newversion)
 					raise RuntimeError('Failed to fully update')
 		finally:
+			# pypy: set journal mode after possible upgrade db:
+			if pypy:
+				cur.execute("PRAGMA journal_mode = MEMORY")
 			cur.close()
 
 	@property
@@ -203,12 +262,13 @@ class Fail2BanDb(object):
 
 		A timestamped backup is also created prior to attempting the update.
 		"""
-		self._dbBackupFilename = self.filename + '.' + time.strftime('%Y%m%d-%H%M%S', MyTime.gmtime())
-		shutil.copyfile(self.filename, self._dbBackupFilename)
-		logSys.info("Database backup created: %s", self._dbBackupFilename)
 		if version > Fail2BanDb.__version__:
 			raise NotImplementedError(
 						"Attempt to travel to future version of database ...how did you get here??")
+
+		self._dbBackupFilename = self.filename + '.' + time.strftime('%Y%m%d-%H%M%S', MyTime.gmtime())
+		shutil.copyfile(self.filename, self._dbBackupFilename)
+		logSys.info("Database backup created: %s", self._dbBackupFilename)
 
 		if version < 2:
 			cur.executescript("BEGIN TRANSACTION;"
@@ -233,8 +293,12 @@ class Fail2BanDb(object):
 			Jail to be added to the database.
 		"""
 		cur.execute(
-			"INSERT OR REPLACE INTO jails(name, enabled) VALUES(?, 1)",
+			"INSERT OR IGNORE INTO jails(name, enabled) VALUES(?, 1)",
 			(jail.name,))
+		if cur.rowcount <= 0:
+			cur.execute(
+				"UPDATE jails SET enabled = 1 WHERE name = ? AND enabled != 1",
+				(jail.name,))
 
 	@commitandrollback
 	def delJail(self, cur, jail):
@@ -257,7 +321,7 @@ class Fail2BanDb(object):
 		cur.execute("UPDATE jails SET enabled=0")
 
 	@commitandrollback
-	def getJailNames(self, cur):
+	def getJailNames(self, cur, enabled=None):
 		"""Get name of jails in database.
 
 		Currently only used for testing purposes.
@@ -267,7 +331,11 @@ class Fail2BanDb(object):
 		set
 			Set of jail names.
 		"""
-		cur.execute("SELECT name FROM jails")
+		if enabled is None:
+			cur.execute("SELECT name FROM jails")
+		else:
+			cur.execute("SELECT name FROM jails WHERE enabled=%s" %
+				(int(enabled),))
 		return set(row[0] for row in cur.fetchmany())
 
 	@commitandrollback
@@ -365,27 +433,32 @@ class Fail2BanDb(object):
 			del self._bansMergedCache[(ticket.getIP(), jail)]
 		except KeyError:
 			pass
+		try:
+			del self._bansMergedCache[(ticket.getIP(), None)]
+		except KeyError:
+			pass
 		#TODO: Implement data parts once arbitrary match keys completed
 		cur.execute(
 			"INSERT INTO bans(jail, ip, timeofban, data) VALUES(?, ?, ?, ?)",
 			(jail.name, ticket.getIP(), int(round(ticket.getTime())),
 				{"matches": ticket.getMatches(),
-					"failures": ticket.getAttempt()}))
+				 "failures": ticket.getAttempt()}))
 
 	@commitandrollback
-	def delBan(self, cur, jail, ticket):
+	def delBan(self, cur, jail, ip):
 		"""Delete a ban from the database.
 
 		Parameters
 		----------
 		jail : Jail
 			Jail in which the ban has occurred.
-		ticket : BanTicket
-			Ticket of the ban to be removed.
+		ip : str
+			IP to be removed.
 		"""
+		queryArgs = (jail.name, ip);
 		cur.execute(
-			"DELETE FROM bans WHERE jail = ? AND ip = ? AND timeofban = ?",
-			(jail.name, ticket.getIP(), int(round(ticket.getTime()))))
+			"DELETE FROM bans WHERE jail = ? AND ip = ?", 
+			queryArgs);
 
 	@commitandrollback
 	def _getBans(self, cur, jail=None, bantime=None, ip=None):
@@ -427,8 +500,8 @@ class Fail2BanDb(object):
 		tickets = []
 		for ip, timeofban, data in self._getBans(**kwargs):
 			#TODO: Implement data parts once arbitrary match keys completed
-			tickets.append(FailTicket(ip, timeofban, data['matches']))
-			tickets[-1].setAttempt(data['failures'])
+			tickets.append(FailTicket(ip, timeofban, data.get('matches')))
+			tickets[-1].setAttempt(data.get('failures', 1))
 		return tickets
 
 	def getBansMerged(self, ip=None, jail=None, bantime=None):
@@ -455,40 +528,41 @@ class Fail2BanDb(object):
 			in a list. When `ip` argument passed, a single `Ticket` is
 			returned.
 		"""
-		cacheKey = None
-		if bantime is None or bantime < 0:
-			cacheKey = (ip, jail)
-			if cacheKey in self._bansMergedCache:
-				return self._bansMergedCache[cacheKey]
+		with self._lock:
+			cacheKey = None
+			if bantime is None or bantime < 0:
+				cacheKey = (ip, jail)
+				if cacheKey in self._bansMergedCache:
+					return self._bansMergedCache[cacheKey]
 
-		tickets = []
-		ticket = None
+			tickets = []
+			ticket = None
 
-		results = list(self._getBans(ip=ip, jail=jail, bantime=bantime))
-		if results:
-			prev_banip = results[0][0]
-			matches = []
-			failures = 0
-			for banip, timeofban, data in results:
-				#TODO: Implement data parts once arbitrary match keys completed
-				if banip != prev_banip:
-					ticket = FailTicket(prev_banip, prev_timeofban, matches)
-					ticket.setAttempt(failures)
-					tickets.append(ticket)
-					# Reset variables
-					prev_banip = banip
-					matches = []
-					failures = 0
-				matches.extend(data['matches'])
-				failures += data['failures']
-				prev_timeofban = timeofban
-			ticket = FailTicket(banip, prev_timeofban, matches)
-			ticket.setAttempt(failures)
-			tickets.append(ticket)
+			results = list(self._getBans(ip=ip, jail=jail, bantime=bantime))
+			if results:
+				prev_banip = results[0][0]
+				matches = []
+				failures = 0
+				for banip, timeofban, data in results:
+					#TODO: Implement data parts once arbitrary match keys completed
+					if banip != prev_banip:
+						ticket = FailTicket(prev_banip, prev_timeofban, matches)
+						ticket.setAttempt(failures)
+						tickets.append(ticket)
+						# Reset variables
+						prev_banip = banip
+						matches = []
+						failures = 0
+					matches.extend(data.get('matches', []))
+					failures += data.get('failures', 1)
+					prev_timeofban = timeofban
+				ticket = FailTicket(banip, prev_timeofban, matches)
+				ticket.setAttempt(failures)
+				tickets.append(ticket)
 
-		if cacheKey:
-			self._bansMergedCache[cacheKey] = tickets if ip is None else ticket
-		return tickets if ip is None else ticket
+			if cacheKey:
+				self._bansMergedCache[cacheKey] = tickets if ip is None else ticket
+			return tickets if ip is None else ticket
 
 	@commitandrollback
 	def purge(self, cur):

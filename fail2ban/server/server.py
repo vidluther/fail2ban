@@ -25,7 +25,12 @@ __copyright__ = "Copyright (c) 2004 Cyril Jaquier"
 __license__ = "GPL"
 
 from threading import Lock, RLock
-import logging, logging.handlers, sys, os, signal
+import logging
+import logging.handlers
+import os
+import signal
+import stat
+import sys
 
 from .jails import Jails
 from .filter import FileFilter, JournalFilter
@@ -43,6 +48,7 @@ except ImportError:
 	# Dont print error here, as database may not even be used
 	Fail2BanDb = None
 
+
 class Server:
 	
 	def __init__(self, daemon = False):
@@ -55,20 +61,32 @@ class Server:
 		self.__asyncServer = AsyncServer(self.__transm)
 		self.__logLevel = None
 		self.__logTarget = None
+		self.__syslogSocket = None
+		self.__autoSyslogSocketPaths = {
+			'Darwin':  '/var/run/syslog',
+			'FreeBSD': '/var/run/log',
+			'Linux': '/dev/log',
+		}
+		self.setSyslogSocket("auto")
 		# Set logging level
 		self.setLogLevel("INFO")
 		self.setLogTarget("STDOUT")
-	
+
 	def __sigTERMhandler(self, signum, frame):
 		logSys.debug("Caught signal %d. Exiting" % signum)
 		self.quit()
 	
+	def __sigUSR1handler(self, signum, fname):
+		logSys.debug("Caught signal %d. Flushing logs" % signum)
+		self.flushLogs()
+
 	def start(self, sock, pidfile, force = False):
 		logSys.info("Starting Fail2ban v" + version.version)
 		
 		# Install signal handlers
 		signal.signal(signal.SIGTERM, self.__sigTERMhandler)
 		signal.signal(signal.SIGINT, self.__sigTERMhandler)
+		signal.signal(signal.SIGUSR1, self.__sigUSR1handler)
 		
 		# Ensure unhandled exceptions are logged
 		sys.excepthook = excepthook
@@ -90,20 +108,20 @@ class Server:
 			pidFile = open(pidfile, 'w')
 			pidFile.write("%s\n" % os.getpid())
 			pidFile.close()
-		except IOError, e:
+		except IOError as e:
 			logSys.error("Unable to create PID file: %s" % e)
 		
 		# Start the communication
 		logSys.debug("Starting communication")
 		try:
 			self.__asyncServer.start(sock, force)
-		except AsyncServerException, e:
+		except AsyncServerException as e:
 			logSys.error("Could not start server: %s", e)
 		# Removes the PID file.
 		try:
 			logSys.debug("Remove PID file %s" % pidfile)
 			os.remove(pidfile)
-		except OSError, e:
+		except OSError as e:
 			logSys.error("Unable to remove PID file: %s" % e)
 		logSys.info("Exiting Fail2ban")
 	
@@ -126,7 +144,6 @@ class Server:
 		finally:
 			self.__loggingLock.release()
 
-	
 	def addJail(self, name, backend):
 		self.__jails.add(name, backend, self.__db)
 		if self.__db is not None:
@@ -195,7 +212,7 @@ class Server:
 		filter_ = self.__jails[name].filter
 		if isinstance(filter_, FileFilter):
 			return [m.getFileName()
-					for m in filter_.getLogPath()]
+					for m in filter_.getLogs()]
 		else: # pragma: systemd no cover
 			logSys.info("Jail %s is not a FileFilter instance" % name)
 			return []
@@ -220,13 +237,11 @@ class Server:
 	
 	def setLogEncoding(self, name, encoding):
 		filter_ = self.__jails[name].filter
-		if isinstance(filter_, FileFilter):
-			filter_.setLogEncoding(encoding)
+		filter_.setLogEncoding(encoding)
 	
 	def getLogEncoding(self, name):
 		filter_ = self.__jails[name].filter
-		if isinstance(filter_, FileFilter):
-			return filter_.getLogEncoding()
+		return filter_.getLogEncoding()
 	
 	def setFindTime(self, name, value):
 		self.__jails[name].filter.setFindTime(value)
@@ -320,9 +335,9 @@ class Server:
 		finally:
 			self.__lock.release()
 	
-	def statusJail(self, name):
-		return self.__jails[name].status
-	
+	def statusJail(self, name, flavor="basic"):
+		return self.__jails[name].status(flavor=flavor)
+
 	# Logging
 	
 	##
@@ -360,7 +375,7 @@ class Server:
 			return self.__logLevel
 		finally:
 			self.__loggingLock.release()
-	
+
 	##
 	# Sets the logging target.
 	#
@@ -376,7 +391,21 @@ class Server:
 				# Syslog daemons already add date to the message.
 				formatter = logging.Formatter("%(name)s[%(process)d]: %(levelname)s %(message)s")
 				facility = logging.handlers.SysLogHandler.LOG_DAEMON
-				hdlr = logging.handlers.SysLogHandler("/dev/log", facility=facility)
+				if self.__syslogSocket == "auto":
+					import platform
+					self.__syslogSocket = self.__autoSyslogSocketPaths.get(
+						platform.system())
+				if self.__syslogSocket is not None\
+						and os.path.exists(self.__syslogSocket)\
+						and stat.S_ISSOCK(os.stat(
+								self.__syslogSocket).st_mode):
+					hdlr = logging.handlers.SysLogHandler(
+						self.__syslogSocket, facility=facility)
+				else:
+					logSys.error(
+						"Syslog socket file: %s does not exists"
+						" or is not a socket" % self.__syslogSocket)
+					return False
 			elif target == "STDOUT":
 				hdlr = logging.StreamHandler(sys.stdout)
 			elif target == "STDERR":
@@ -412,21 +441,44 @@ class Server:
 			logger.addHandler(hdlr)
 			# Does not display this message at startup.
 			if not self.__logTarget is None:
-				logSys.info("Changed logging target to %s for Fail2ban v%s" %
-						(target, version.version))
+				logSys.info(
+					"Changed logging target to %s for Fail2ban v%s"
+					% ((target
+						if target != "SYSLOG"
+						else "%s (%s)"
+							 % (target, self.__syslogSocket)),
+					   version.version))
 			# Sets the logging target.
 			self.__logTarget = target
 			return True
 		finally:
 			self.__loggingLock.release()
-	
+
+	##
+	# Sets the syslog socket.
+	#
+	# syslogsocket is the full path to the syslog socket
+	# @param syslogsocket the syslog socket path
+	def setSyslogSocket(self, syslogsocket):
+		self.__syslogSocket = syslogsocket
+		# Conditionally reload, logtarget depends on socket path when SYSLOG
+		return self.__logTarget != "SYSLOG"\
+			   or self.setLogTarget(self.__logTarget)
+
 	def getLogTarget(self):
 		try:
 			self.__loggingLock.acquire()
 			return self.__logTarget
 		finally:
 			self.__loggingLock.release()
-	
+
+	def getSyslogSocket(self):
+		try:
+			self.__loggingLock.acquire()
+			return self.__syslogSocket
+		finally:
+			self.__loggingLock.release()
+
 	def flushLogs(self):
 		if self.__logTarget not in ['STDERR', 'STDOUT', 'SYSLOG']:
 			for handler in getLogger("fail2ban").handlers:
@@ -444,24 +496,27 @@ class Server:
 			return "flushed"
 			
 	def setDatabase(self, filename):
-		if len(self.__jails) == 0:
-			if filename.lower() == "none":
-				self.__db = None
-			else:
-				if Fail2BanDb is not None:
-					self.__db = Fail2BanDb(filename)
-					self.__db.delAllJails()
-				else:
-					logSys.error(
-						"Unable to import fail2ban database module as sqlite "
-						"is not available.")
-		else:
+		# if not changed - nothing to do
+		if self.__db and self.__db.filename == filename:
+			return
+		if not self.__db and filename.lower() == 'none':
+			return
+		if len(self.__jails) != 0:
 			raise RuntimeError(
 				"Cannot change database when there are jails present")
+		if filename.lower() == "none":
+			self.__db = None
+		else:
+			if Fail2BanDb is not None:
+				self.__db = Fail2BanDb(filename)
+				self.__db.delAllJails()
+			else:
+				logSys.error(
+					"Unable to import fail2ban database module as sqlite "
+					"is not available.")
 	
 	def getDatabase(self):
 		return self.__db
-	
 
 	def __createDaemon(self): # pragma: no cover
 		""" Detach a process from the controlling terminal and run it in the
@@ -486,7 +541,7 @@ class Server:
 			# the child gets a new PID, making it impossible for its PID to equal its
 			# PGID.
 			pid = os.fork()
-		except OSError, e:
+		except OSError as e:
 			return((e.errno, e.strerror))	 # ERROR (return a tuple)
 		
 		if pid == 0:	   # The first child.
@@ -507,7 +562,7 @@ class Server:
 				# fork guarantees that the child is no longer a session leader, thus
 				# preventing the daemon from ever acquiring a controlling terminal.
 				pid = os.fork()		# Fork a second child.
-			except OSError, e:
+			except OSError as e:
 				return((e.errno, e.strerror))  # ERROR (return a tuple)
 		
 			if (pid == 0):	  # The second child.

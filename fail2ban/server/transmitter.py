@@ -33,6 +33,7 @@ from .. import version
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
 
+
 class Transmitter:
 	
 	##
@@ -51,11 +52,11 @@ class Transmitter:
 	
 	def proceed(self, command):
 		# Deserialize object
-		logSys.debug("Command: " + `command`)
+		logSys.debug("Command: " + repr(command))
 		try:
 			ret = self.__commandHandler(command)
 			ack = 0, ret
-		except Exception, e:
+		except Exception as e:
 			logSys.warning("Command %r has failed. Received %r"
 						% (command, e))
 			ack = 1, e
@@ -121,6 +122,12 @@ class Transmitter:
 				return self.__server.getLogTarget()
 			else:
 				raise Exception("Failed to change log target")
+		elif name == "syslogsocket":
+			value = command[1]
+			if self.__server.setSyslogSocket(value):
+				return self.__server.getSyslogSocket()
+			else:
+				raise Exception("Failed to change syslog socket")
 		#Database
 		elif name == "dbfile":
 			self.__server.setDatabase(command[1])
@@ -132,6 +139,7 @@ class Transmitter:
 		elif name == "dbpurgeage":
 			db = self.__server.getDatabase()
 			if db is None:
+				logSys.warning("dbpurgeage setting was not in effect since no db yet")
 				return None
 			else:
 				db.purgeage = command[1]
@@ -264,6 +272,8 @@ class Transmitter:
 			return self.__server.getLogLevel()
 		elif name == "logtarget":
 			return self.__server.getLogTarget()
+		elif name == "syslogsocket":
+			return self.__server.getSyslogSocket()
 		#Database
 		elif name == "dbfile":
 			db = self.__server.getDatabase()
@@ -333,5 +343,8 @@ class Transmitter:
 		elif len(command) == 1:
 			name = command[0]
 			return self.__server.statusJail(name)
+		elif len(command) == 2:
+			name = command[0]
+			flavor = command[1]
+			return self.__server.statusJail(name, flavor=flavor)
 		raise Exception("Invalid command (no status)")
-	

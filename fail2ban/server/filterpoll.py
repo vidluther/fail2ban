@@ -24,7 +24,8 @@ __author__ = "Cyril Jaquier, Yaroslav Halchenko"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier; 2012 Yaroslav Halchenko"
 __license__ = "GPL"
 
-import time, os
+import os
+import time
 
 from .failmanager import FailManagerEmpty
 from .filter import FileFilter
@@ -33,6 +34,7 @@ from ..helpers import getLogger
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
+
 
 ##
 # Log reader class.
@@ -86,10 +88,10 @@ class FilterPoll(FileFilter):
 		while self.active:
 			if logSys.getEffectiveLevel() <= 6:
 				logSys.log(6, "Woke up idle=%s with %d files monitored",
-						   self.idle, len(self.getLogPath()))
+						   self.idle, len(self.getLogs()))
 			if not self.idle:
 				# Get file modification
-				for container in self.getLogPath():
+				for container in self.getLogs():
 					filename = container.getFileName()
 					if self.isModified(filename):
 						self.getFailures(filename)
@@ -136,7 +138,7 @@ class FilterPoll(FileFilter):
 				logSys.debug("%s has been modified", filename)
 				self.__prevStats[filename] = stats
 				return True
-		except OSError, e:
+		except OSError as e:
 			logSys.error("Unable to get stat on %s because of: %s"
 						 % (filename, e))
 			self.__file404Cnt[filename] += 1

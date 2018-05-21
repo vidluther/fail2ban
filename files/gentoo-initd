@@ -18,6 +18,9 @@
 # Author: Sireyessire, Cyril Jaquier
 #
 
+description="Daemon to ban hosts that cause multiple authentication errors"
+description_reload="reload configuration"
+description_showlog="show fail2ban logs"
 extra_started_commands="reload showlog"
 
 FAIL2BAN="/usr/bin/fail2ban-client ${FAIL2BAN_OPTIONS}"
@@ -30,27 +33,25 @@ depend() {
 
 start() {
 	ebegin "Starting fail2ban"
-	if [ ! -d /var/run/fail2ban ]; then
-		mkdir /var/run/fail2ban || return 1
-	fi
-	if [ -e /var/run/fail2ban/fail2ban.sock ]; then
-		# remove stalled sock file after system crash
-		# bug 347477
-		rm -rf /var/run/fail2ban/fail2ban.sock || return 1
-	fi
-	${FAIL2BAN} start &> /dev/null
+	mkdir -p /var/run/fail2ban || return 1
+	# remove stalled sock file after system crash
+	# bug 347477
+	rm -f /var/run/fail2ban/fail2ban.sock || return 1
+	start-stop-daemon --start --pidfile /var/run/fail2ban/fail2ban.pid \
+	-- ${FAIL2BAN} start
 	eend $? "Failed to start fail2ban"
 }
 
 stop() {
 	ebegin "Stopping fail2ban"
-	${FAIL2BAN} stop &> /dev/null
+	start-stop-daemon --stop --pidfile /var/run/fail2ban/fail2ban.pid --retry 30 \
+	-- ${FAIL2BAN} stop
 	eend $? "Failed to stop fail2ban"
 }
 
 reload() {
 	ebegin "Reloading fail2ban"
-	${FAIL2BAN} reload > /dev/null
+	${FAIL2BAN} reload
 	eend $? "Failed to reload fail2ban"
 }
 

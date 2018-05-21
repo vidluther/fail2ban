@@ -23,13 +23,16 @@ __author__ = "Cyril Jaquier, Lee Clemens, Yaroslav Halchenko"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2011-2012 Lee Clemens, 2012 Yaroslav Halchenko"
 __license__ = "GPL"
 
-import Queue, logging
+import logging
+import Queue
 
 from .actions import Actions
+from ..client.jailreader import JailReader
 from ..helpers import getLogger
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
+
 
 class Jail:
 	"""Fail2Ban jail, which manages a filter and associated actions.
@@ -80,6 +83,7 @@ class Jail:
 		return "%s(%r)" % (self.__class__.__name__, self.name)
 
 	def _setBackend(self, backend):
+		backend, beArgs = JailReader.extractOptions(backend)
 		backend = backend.lower()		# to assure consistent matching
 
 		backends = self._BACKENDS
@@ -96,7 +100,7 @@ class Jail:
 		for b in backends:
 			initmethod = getattr(self, '_init%s' % b.capitalize())
 			try:
-				initmethod()
+				initmethod(**beArgs)
 				if backend != 'auto' and b != backend:
 					logSys.warning("Could only initiated %r backend whenever "
 								   "%r was requested" % (b, backend))
@@ -104,7 +108,7 @@ class Jail:
 					logSys.info("Initiated %r backend" % b)
 				self.__actions = Actions(self)
 				return					# we are done
-			except ImportError, e:
+			except ImportError as e:
 				# Log debug if auto, but error if specific
 				logSys.log(
 					logging.DEBUG if backend == "auto" else logging.ERROR,
@@ -115,29 +119,28 @@ class Jail:
 		raise RuntimeError(
 			"Failed to initialize any backend for Jail %r" % self.name)
 
-
-	def _initPolling(self):
+	def _initPolling(self, **kwargs):
 		from filterpoll import FilterPoll
-		logSys.info("Jail '%s' uses poller" % self.name)
-		self.__filter = FilterPoll(self)
+		logSys.info("Jail '%s' uses poller %r" % (self.name, kwargs))
+		self.__filter = FilterPoll(self, **kwargs)
 
-	def _initGamin(self):
+	def _initGamin(self, **kwargs):
 		# Try to import gamin
 		from filtergamin import FilterGamin
-		logSys.info("Jail '%s' uses Gamin" % self.name)
-		self.__filter = FilterGamin(self)
+		logSys.info("Jail '%s' uses Gamin %r" % (self.name, kwargs))
+		self.__filter = FilterGamin(self, **kwargs)
 
-	def _initPyinotify(self):
+	def _initPyinotify(self, **kwargs):
 		# Try to import pyinotify
 		from filterpyinotify import FilterPyinotify
-		logSys.info("Jail '%s' uses pyinotify" % self.name)
-		self.__filter = FilterPyinotify(self)
+		logSys.info("Jail '%s' uses pyinotify %r" % (self.name, kwargs))
+		self.__filter = FilterPyinotify(self, **kwargs)
 
-	def _initSystemd(self): # pragma: systemd no cover
+	def _initSystemd(self, **kwargs): # pragma: systemd no cover
 		# Try to import systemd
 		from filtersystemd import FilterSystemd
-		logSys.info("Jail '%s' uses systemd" % self.name)
-		self.__filter = FilterSystemd(self)
+		logSys.info("Jail '%s' uses systemd %r" % (self.name, kwargs))
+		self.__filter = FilterSystemd(self, **kwargs)
 
 	@property
 	def name(self):
@@ -174,13 +177,12 @@ class Jail:
 		self.filter.idle = value
 		self.actions.idle = value
 
-	@property
-	def status(self):
+	def status(self, flavor="basic"):
 		"""The status of the jail.
 		"""
 		return [
-			("Filter", self.filter.status),
-			("Actions", self.actions.status),
+			("Filter", self.filter.status(flavor=flavor)),
+			("Actions", self.actions.status(flavor=flavor)),
 			]
 
 	def putFailTicket(self, ticket):
@@ -214,7 +216,7 @@ class Jail:
 		if self.database is not None:
 			for ticket in self.database.getBansMerged(
 				jail=self, bantime=self.actions.getBanTime()):
-				if not self.filter.inIgnoreIPList(ticket.getIP()):
+				if not self.filter.inIgnoreIPList(ticket.getIP(), log_ignore=True):
 					self.__queue.put(ticket)
 		logSys.info("Jail '%s' started" % self.name)
 

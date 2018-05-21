@@ -24,11 +24,15 @@ __author__ = "Cyril Jaquier"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier"
 __license__ = "GPL"
 
+import os
 import time
+import tempfile
 
 from ..server.action import CommandAction, CallingMap
+from ..server.actions import OrderedDict
 
 from .utils import LogCaptureTestCase
+from .utils import pid_exists
 
 class CommandActionTest(LogCaptureTestCase):
 
@@ -55,10 +59,68 @@ class CommandActionTest(LogCaptureTestCase):
 		# Unresolveable substition
 		self.assertFalse(CommandAction.substituteRecursiveTags({'A': 'to=<B> fromip=<IP>', 'C': '<B>', 'B': '<C>', 'D': ''}))
 		self.assertFalse(CommandAction.substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP>', 'sweet': '<honeypot>', 'honeypot': '<sweet>', 'ignoreregex': ''}))
+		# We need here an ordered, because the sequence of iteration is very important for this test
+		if OrderedDict:
+			# No cyclic recursion, just multiple replacement of tag <T>, should be successful:
+			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict(
+					(('X', 'x=x<T>'), ('T', '1'), ('Z', '<X> <T> <Y>'), ('Y', 'y=y<T>')))
+				), {'X': 'x=x1', 'T': '1', 'Y': 'y=y1', 'Z': 'x=x1 1 y=y1'}
+			)
+			# No cyclic recursion, just multiple replacement of tag <T> in composite tags, should be successful:
+			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict(
+				  (('X', 'x=x<T> <Z> <<R1>> <<R2>>'), ('R1', 'Z'), ('R2', 'Y'), ('T', '1'), ('Z', '<T> <Y>'), ('Y', 'y=y<T>')))
+				), {'X': 'x=x1 1 y=y1 1 y=y1 y=y1', 'R1': 'Z', 'R2': 'Y', 'T': '1', 'Z': '1 y=y1', 'Y': 'y=y1'}
+			)
+			# No cyclic recursion, just multiple replacement of same tags, should be successful:
+			self.assertEqual(CommandAction.substituteRecursiveTags( OrderedDict((
+					('actionstart', 'ipset create <ipmset> hash:ip timeout <bantime> family <ipsetfamily>\n<iptables> -I <chain> <actiontype>'),
+					('ipmset', 'f2b-<name>'),
+					('name', 'any'),
+					('bantime', '600'),
+					('ipsetfamily', 'inet'),
+					('iptables', 'iptables <lockingopt>'),
+					('lockingopt', '-w'),
+					('chain', 'INPUT'),
+					('actiontype', '<multiport>'),
+					('multiport', '-p <protocol> -m multiport --dports <port> -m set --match-set <ipmset> src -j <blocktype>'),
+					('protocol', 'tcp'),
+					('port', 'ssh'),
+					('blocktype', 'REJECT',),
+				))
+				), OrderedDict((
+					('actionstart', 'ipset create f2b-any hash:ip timeout 600 family inet\niptables -w -I INPUT -p tcp -m multiport --dports ssh -m set --match-set f2b-any src -j REJECT'),
+					('ipmset', 'f2b-any'),
+					('name', 'any'),
+					('bantime', '600'),
+					('ipsetfamily', 'inet'),
+					('iptables', 'iptables -w'),
+					('lockingopt', '-w'),
+					('chain', 'INPUT'),
+					('actiontype', '-p tcp -m multiport --dports ssh -m set --match-set f2b-any src -j REJECT'),
+					('multiport', '-p tcp -m multiport --dports ssh -m set --match-set f2b-any src -j REJECT'),
+					('protocol', 'tcp'),
+					('port', 'ssh'),
+					('blocktype', 'REJECT')
+				))
+			)
+			# Cyclic recursion by composite tag creation, tags "create" another tag, that closes cycle:
+			self.assertFalse(CommandAction.substituteRecursiveTags( OrderedDict((
+					('A', '<<B><C>>'),
+					('B', 'D'), ('C', 'E'),
+					('DE', 'cycle <A>'),
+			)) ))
+			self.assertFalse(CommandAction.substituteRecursiveTags( OrderedDict((
+					('DE', 'cycle <A>'),
+					('A', '<<B><C>>'),
+					('B', 'D'), ('C', 'E'),
+			)) ))
+			
 		# missing tags are ok
 		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C>'}), {'A': '<C>'})
 		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C> <D> <X>','X':'fun'}), {'A': '<C> <D> fun', 'X':'fun'})
 		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<C> <B>', 'B': 'cool'}), {'A': '<C> cool', 'B': 'cool'})
+		# Escaped tags should be ignored
+		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<matches> <B>', 'B': 'cool'}), {'A': '<matches> cool', 'B': 'cool'})
 		# Multiple stuff on same line is ok
 		self.assertEqual(CommandAction.substituteRecursiveTags({'failregex': 'to=<honeypot> fromip=<IP> evilperson=<honeypot>', 'honeypot': 'pokie', 'ignoreregex': ''}),
 								{ 'failregex': "to=pokie fromip=<IP> evilperson=pokie",
@@ -71,6 +133,14 @@ class CommandActionTest(LogCaptureTestCase):
 									'ABC': '123 192.0.2.0',
 									'xyz': '890 123 192.0.2.0',
 								})
+		# obscure embedded case
+		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4'}),
+						 {'A': '<IPV4HOST>', 'PREF': 'IPV4'})
+		self.assertEqual(CommandAction.substituteRecursiveTags({'A': '<<PREF>HOST>', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'}),
+						 {'A': '1.2.3.4', 'PREF': 'IPV4', 'IPV4HOST': '1.2.3.4'})
+		# more embedded within a string and two interpolations
+		self.assertEqual(CommandAction.substituteRecursiveTags({'A': 'A <IP<PREF>HOST> B IP<PREF> C', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'}),
+						 {'A': 'A 1.2.3.4 B IPV4 C', 'PREF': 'V4', 'IPV4HOST': '1.2.3.4'})
 
 	def testReplaceTag(self):
 		aInfo = {
@@ -100,7 +170,6 @@ class CommandActionTest(LogCaptureTestCase):
 				{'ipjailmatches': "some >char< should \< be[ escap}ed&\n"}),
 			"some \\>char\\< should \\\\\\< be\\[ escap\\}ed\\&\n")
 
-
 		# Recursive
 		aInfo["ABC"] = "<xyz>"
 		self.assertEqual(
@@ -113,6 +182,7 @@ class CommandActionTest(LogCaptureTestCase):
 				CallingMap(matches=lambda: str(10))),
 			"09 10 11")
 
+	def testReplaceNoTag(self):
 		# As tag not present, therefore callable should not be called
 		# Will raise ValueError if it is
 		self.assertEqual(
@@ -131,17 +201,17 @@ class CommandActionTest(LogCaptureTestCase):
 		self.__action.actionunban = "true"
 		self.assertEqual(self.__action.actionunban, 'true')
 
-		self.assertFalse(self._is_logged('returned'))
+		self.assertNotLogged('returned')
 		# no action was actually executed yet
 
 		self.__action.ban({'ip': None})
-		self.assertTrue(self._is_logged('Invariant check failed'))
-		self.assertTrue(self._is_logged('returned successfully'))
+		self.assertLogged('Invariant check failed')
+		self.assertLogged('returned successfully')
 
 	def testExecuteActionEmptyUnban(self):
 		self.__action.actionunban = ""
 		self.__action.unban({})
-		self.assertTrue(self._is_logged('Nothing to do'))
+		self.assertLogged('Nothing to do')
 
 	def testExecuteActionStartCtags(self):
 		self.__action.HOST = "192.0.2.0"
@@ -156,7 +226,7 @@ class CommandActionTest(LogCaptureTestCase):
 		self.__action.actionban = "rm /tmp/fail2ban.test"
 		self.__action.actioncheck = "[ -e /tmp/fail2ban.test ]"
 		self.assertRaises(RuntimeError, self.__action.ban, {'ip': None})
-		self.assertTrue(self._is_logged('Unable to restore environment'))
+		self.assertLogged('Unable to restore environment')
 
 	def testExecuteActionChangeCtags(self):
 		self.assertRaises(AttributeError, getattr, self.__action, "ROST")
@@ -175,28 +245,68 @@ class CommandActionTest(LogCaptureTestCase):
 	def testExecuteActionStartEmpty(self):
 		self.__action.actionstart = ""
 		self.__action.start()
-		self.assertTrue(self._is_logged('Nothing to do'))
+		self.assertLogged('Nothing to do')
 
 	def testExecuteIncorrectCmd(self):
 		CommandAction.executeCmd('/bin/ls >/dev/null\nbogusXXX now 2>/dev/null')
-		self.assertTrue(self._is_logged('HINT on 127: "Command not found"'))
+		self.assertLogged('HINT on 127: "Command not found"')
 
 	def testExecuteTimeout(self):
 		stime = time.time()
 		# Should take a minute
-		self.assertRaises(
-			RuntimeError, CommandAction.executeCmd, 'sleep 60', timeout=2)
-		self.assertAlmostEqual(time.time() - stime, 2, places=0)
-		self.assertTrue(self._is_logged('sleep 60 -- timed out after 2 seconds'))
-		self.assertTrue(self._is_logged('sleep 60 -- killed with SIGTERM'))
+		self.assertFalse(CommandAction.executeCmd('sleep 60', timeout=2))
+		# give a test still 1 second, because system could be too busy
+		self.assertTrue(time.time() >= stime + 2 and time.time() <= stime + 3)
+		self.assertLogged(
+			'sleep 60 -- timed out after 2 seconds',
+			'sleep 60 -- timed out after 3 seconds'
+		)
+		self.assertLogged('sleep 60 -- killed with SIGTERM')
+
+	def testExecuteTimeoutWithNastyChildren(self):
+		# temporary file for a nasty kid shell script
+		tmpFilename = tempfile.mktemp(".sh", "fail2ban_")
+		# Create a nasty script which would hang there for a while
+		with open(tmpFilename, 'w') as f:
+			f.write("""#!/bin/bash
+		trap : HUP EXIT TERM
+
+		echo "$$" > %s.pid
+		echo "my pid $$ . sleeping lo-o-o-ong"
+		sleep 10000
+		""" % tmpFilename)
+
+		def getnastypid():
+			with open(tmpFilename + '.pid') as f:
+				return int(f.read())
+
+		# First test if can kill the bastard
+		self.assertFalse(CommandAction.executeCmd(
+		                 'bash %s' % tmpFilename, timeout=.1))
+		# Verify that the process itself got killed
+		self.assertFalse(pid_exists(getnastypid()))  # process should have been killed
+		self.assertLogged('timed out')
+		self.assertLogged('killed with SIGTERM')
+
+		# A bit evolved case even though, previous test already tests killing children processes
+		self.assertFalse(CommandAction.executeCmd(
+			'out=`bash %s`; echo ALRIGHT' % tmpFilename, timeout=.2))
+		# Verify that the process itself got killed
+		self.assertFalse(pid_exists(getnastypid()))
+		self.assertLogged('timed out')
+		self.assertLogged('killed with SIGTERM')
+
+		os.unlink(tmpFilename)
+		os.unlink(tmpFilename + '.pid')
+
 
 	def testCaptureStdOutErr(self):
 		CommandAction.executeCmd('echo "How now brown cow"')
-		self.assertTrue(self._is_logged("'How now brown cow\\n'"))
+		self.assertLogged("'How now brown cow\\n'")
 		CommandAction.executeCmd(
 			'echo "The rain in Spain stays mainly in the plain" 1>&2')
-		self.assertTrue(self._is_logged(
-			"'The rain in Spain stays mainly in the plain\\n'"))
+		self.assertLogged(
+			"'The rain in Spain stays mainly in the plain\\n'")
 
 	def testCallingMap(self):
 		mymap = CallingMap(callme=lambda: str(10), error=lambda: int('a'),

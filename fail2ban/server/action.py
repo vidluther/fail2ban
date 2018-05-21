@@ -21,8 +21,14 @@ __author__ = "Cyril Jaquier and Fail2Ban Contributors"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2011-2012 Yaroslav Halchenko"
 __license__ = "GPL"
 
-import logging, os, subprocess, time, signal, tempfile
-import threading, re
+import logging
+import os
+import re
+import signal
+import subprocess
+import tempfile
+import threading
+import time
 from abc import ABCMeta
 from collections import MutableMapping
 
@@ -48,6 +54,10 @@ _RETCODE_HINTS = {
 # Dictionary to lookup signal name from number
 signame = dict((num, name)
 	for name, num in signal.__dict__.iteritems() if name.startswith("SIG"))
+
+# max tag replacement count:
+MAX_TAG_REPLACE_COUNT = 10
+
 
 class CallingMap(MutableMapping):
 	"""A Mapping type which returns the result of callable values.
@@ -93,6 +103,7 @@ class CallingMap(MutableMapping):
 
 	def copy(self):
 		return self.__class__(self.data.copy())
+
 
 class ActionBase(object):
 	"""An abstract base class for actions in Fail2Ban.
@@ -175,6 +186,7 @@ class ActionBase(object):
 			the ban.
 		"""
 		pass
+
 
 class CommandAction(ActionBase):
 	"""A action which executes OS shell commands.
@@ -362,6 +374,7 @@ class CommandAction(ActionBase):
 	@classmethod
 	def substituteRecursiveTags(cls, tags):
 		"""Sort out tag definitions within other tags.
+		Since v.0.9.2 supports embedded interpolation (see test cases for examples).
 
 		so:		becomes:
 		a = 3		a = 3
@@ -378,38 +391,51 @@ class CommandAction(ActionBase):
 			Dictionary of tags(keys) and their values, with tags
 			within the values recursively replaced.
 		"""
-		t = re.compile(r'<([^ >]+)>')
-		for tag in tags.iterkeys():
-			if tag in cls._escapedTags:
-				# Escaped so won't match
-				continue
-			value = str(tags[tag])
-			m = t.search(value)
-			done = []
-			#logSys.log(5, 'TAG: %s, value: %s' % (tag, value))
-			while m:
-				found_tag = m.group(1)
-				#logSys.log(5, 'found: %s' % found_tag)
-				if found_tag == tag or found_tag in done:
-					# recursive definitions are bad
-					#logSys.log(5, 'recursion fail tag: %s value: %s' % (tag, value) )
-					return False
-				elif found_tag in cls._escapedTags:
-					# Escaped so won't match
-					continue
-				else:
-					if tags.has_key(found_tag):
-						value = value.replace('<%s>' % found_tag , tags[found_tag])
-						#logSys.log(5, 'value now: %s' % value)
-						done.append(found_tag)
-						m = t.search(value, m.start())
-					else:
-						# Missing tags are ok so we just continue on searching.
-						# cInfo can contain aInfo elements like <HOST> and valid shell
+		t = re.compile(r'<([^ <>]+)>')
+		# repeat substitution while embedded-recursive (repFlag is True)
+		done = cls._escapedTags.copy()
+		while True:
+			repFlag = False
+			# substitute each value:
+			for tag in tags.iterkeys():
+				# ignore escaped or already done:
+				if tag in done: continue
+				value = str(tags[tag])
+				# search and replace all tags within value, that can be interpolated using other tags:
+				m = t.search(value)
+				refCounts = {}
+				#logSys.log(5, 'TAG: %s, value: %s' % (tag, value))
+				while m:
+					found_tag = m.group(1)
+					#logSys.log(5, 'found: %s' % found_tag)
+					if found_tag == tag or refCounts.get(found_tag, 1) > MAX_TAG_REPLACE_COUNT:
+						# recursive definitions are bad
+						#logSys.log(5, 'recursion fail tag: %s value: %s' % (tag, value) )
+						return False
+					if found_tag in cls._escapedTags or not found_tag in tags:
+						# Escaped or missing tags - just continue on searching after end of match
+						# Missing tags are ok - cInfo can contain aInfo elements like <HOST> and valid shell
 						# constructs like <STDIN>.
-						m = t.search(value, m.start() + 1)
-			#logSys.log(5, 'TAG: %s, newvalue: %s' % (tag, value))
-			tags[tag] = value
+						m = t.search(value, m.end())
+						continue
+					value = value.replace('<%s>' % found_tag , tags[found_tag])
+					#logSys.log(5, 'value now: %s' % value)
+					# increment reference count:
+					refCounts[found_tag] = refCounts.get(found_tag, 0) + 1
+					# the next match for replace:
+					m = t.search(value, m.start())
+				#logSys.log(5, 'TAG: %s, newvalue: %s' % (tag, value))
+				# was substituted?
+				if tags[tag] != value:
+					# check still contains any tag - should be repeated (possible embedded-recursive substitution):
+					if t.search(value):
+						repFlag = True
+					tags[tag] = value
+				# no more sub tags (and no possible composite), add this tag to done set (just to be faster):
+				if '<' not in value: done.add(tag)
+			# stop interpolation, if no replacements anymore:
+			if not repFlag:
+				break
 		return tags
 
 	@staticmethod
@@ -507,10 +533,10 @@ class CommandAction(ActionBase):
 			realCmd = self.replaceTag(cmd, aInfo)
 		else:
 			realCmd = cmd
-		
+
 		# Replace static fields
 		realCmd = self.replaceTag(realCmd, self._properties)
-		
+
 		return self.executeCmd(realCmd, self.timeout)
 
 	@staticmethod
@@ -540,31 +566,35 @@ class CommandAction(ActionBase):
 		if not realCmd:
 			logSys.debug("Nothing to do")
 			return True
-		
+
 		_cmd_lock.acquire()
-		try: # Try wrapped within another try needed for python version < 2.5
+		try:
+			retcode = None  # to guarantee being defined upon early except
 			stdout = tempfile.TemporaryFile(suffix=".stdout", prefix="fai2ban_")
 			stderr = tempfile.TemporaryFile(suffix=".stderr", prefix="fai2ban_")
-			try:
-				popen = subprocess.Popen(
-					realCmd, stdout=stdout, stderr=stderr, shell=True)
-				stime = time.time()
+
+			popen = subprocess.Popen(
+				realCmd, stdout=stdout, stderr=stderr, shell=True,
+				preexec_fn=os.setsid  # so that killpg does not kill our process
+			)
+			stime = time.time()
+			retcode = popen.poll()
+			while time.time() - stime <= timeout and retcode is None:
+				time.sleep(0.1)
 				retcode = popen.poll()
-				while time.time() - stime <= timeout and retcode is None:
+			if retcode is None:
+				logSys.error("%s -- timed out after %i seconds." %
+				    (realCmd, timeout))
+				pgid = os.getpgid(popen.pid)
+				os.killpg(pgid, signal.SIGTERM)  # Terminate the process
+				time.sleep(0.1)
+				retcode = popen.poll()
+				if retcode is None:  # Still going...
+					os.killpg(pgid, signal.SIGKILL)  # Kill the process
 					time.sleep(0.1)
 					retcode = popen.poll()
-				if retcode is None:
-					logSys.error("%s -- timed out after %i seconds." %
-						(realCmd, timeout))
-					os.kill(popen.pid, signal.SIGTERM) # Terminate the process
-					time.sleep(0.1)
-					retcode = popen.poll()
-					if retcode is None: # Still going...
-						os.kill(popen.pid, signal.SIGKILL) # Kill the process
-						time.sleep(0.1)
-						retcode = popen.poll()
-			except OSError, e:
-				logSys.error("%s -- failed with %s" % (realCmd, e))
+		except OSError as e:
+			logSys.error("%s -- failed with %s" % (realCmd, e))
 		finally:
 			_cmd_lock.release()
 
@@ -582,15 +612,16 @@ class CommandAction(ActionBase):
 			return True
 		elif retcode is None:
 			logSys.error("%s -- unable to kill PID %i" % (realCmd, popen.pid))
-		elif retcode < 0:
-			logSys.error("%s -- killed with %s" %
-				(realCmd, signame.get(-retcode, "signal %i" % -retcode)))
+		elif retcode < 0 or retcode > 128:
+			# dash would return negative while bash 128 + n
+			sigcode = -retcode if retcode < 0 else retcode - 128
+			logSys.error("%s -- killed with %s (return code: %s)" %
+				(realCmd, signame.get(sigcode, "signal %i" % sigcode), retcode))
 		else:
 			msg = _RETCODE_HINTS.get(retcode, None)
 			logSys.error("%s -- returned %i" % (realCmd, retcode))
 			if msg:
 				logSys.info("HINT on %i: %s"
 							% (retcode, msg % locals()))
-			return False
-		raise RuntimeError("Command execution failed: %s" % realCmd)
-	
+		return False
+

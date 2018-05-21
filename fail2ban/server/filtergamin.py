@@ -23,7 +23,8 @@ __author__ = "Cyril Jaquier, Yaroslav Halchenko"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2012 Yaroslav Halchenko"
 __license__ = "GPL"
 
-import time, fcntl
+import fcntl
+import time
 
 import gamin
 
@@ -34,6 +35,7 @@ from ..helpers import getLogger
 
 # Gets the instance of the logger.
 logSys = getLogger(__name__)
+
 
 ##
 # Log reader class.
@@ -60,15 +62,13 @@ class FilterGamin(FileFilter):
 		fcntl.fcntl(fd, fcntl.F_SETFD, flags|fcntl.FD_CLOEXEC)
 		logSys.debug("Created FilterGamin")
 
-
 	def callback(self, path, event):
-		logSys.debug("Got event: " + `event` + " for " + path)
+		logSys.debug("Got event: " + repr(event) + " for " + path)
 		if event in (gamin.GAMCreated, gamin.GAMChanged, gamin.GAMExists):
 			logSys.debug("File changed: " + path)
 			self.__modified = True
 
 		self._process_file(path)
-
 
 	def _process_file(self, path):
 		"""Process a given file
@@ -121,7 +121,6 @@ class FilterGamin(FileFilter):
 		logSys.debug(self.jail.name + ": filter terminated")
 		return True
 
-
 	def stop(self):
 		super(FilterGamin, self).stop()
 		self.__cleanup()
@@ -130,6 +129,6 @@ class FilterGamin(FileFilter):
 	# Desallocates the resources used by Gamin.
 
 	def __cleanup(self):
-		for path in self.getLogPath():
-			self.monitor.stop_watch(path.getFileName())
+		for log in self.getLogs():
+			self.monitor.stop_watch(log.getFileName())
 		del self.monitor

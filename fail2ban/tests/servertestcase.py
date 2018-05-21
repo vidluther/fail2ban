@@ -30,6 +30,7 @@ import tempfile
 import os
 import locale
 import sys
+import platform
 
 from ..server.failregex import Regex, FailRegex, RegexException
 from ..server.server import Server
@@ -46,11 +47,14 @@ except ImportError: # pragma: no cover
 
 TEST_FILES_DIR = os.path.join(os.path.dirname(__file__), "files")
 
+
 class TestServer(Server):
 	def setLogLevel(self, *args, **kwargs):
 		pass
+
 	def setLogTarget(self, *args, **kwargs):
 		pass
+
 
 class TransmitterBase(unittest.TestCase):
 	
@@ -70,17 +74,24 @@ class TransmitterBase(unittest.TestCase):
 		"""Call after every test case."""
 		self.server.quit()
 
-	def setGetTest(self, cmd, inValue, outValue=None, jail=None):
+	def setGetTest(self, cmd, inValue, outValue=None, outCode=0, jail=None, repr_=False):
 		setCmd = ["set", cmd, inValue]
 		getCmd = ["get", cmd]
 		if jail is not None:
 			setCmd.insert(1, jail)
 			getCmd.insert(1, jail)
+
 		if outValue is None:
 			outValue = inValue
 
-		self.assertEqual(self.transm.proceed(setCmd), (0, outValue))
-		self.assertEqual(self.transm.proceed(getCmd), (0, outValue))
+		def v(x):
+			"""Prepare value for comparison"""
+			return (repr(x) if repr_ else x)
+
+		self.assertEqual(v(self.transm.proceed(setCmd)), v((outCode, outValue)))
+		if not outCode:
+			# if we expected to get it set without problem, check new value
+			self.assertEqual(v(self.transm.proceed(getCmd)), v((0, outValue)))
 
 	def setGetTestNOK(self, cmd, inValue, jail=None):
 		setCmd = ["set", cmd, inValue]
@@ -102,19 +113,15 @@ class TransmitterBase(unittest.TestCase):
 		self.assertEqual(
 			self.transm.proceed(["get", jail, cmd]), (0, []))
 		for n, value in enumerate(values):
-			self.assertEqual(
-				self.transm.proceed(["set", jail, cmdAdd, value]),
-				(0, values[:n+1]))
-			self.assertEqual(
-				self.transm.proceed(["get", jail, cmd]),
-				(0, values[:n+1]))
+			ret = self.transm.proceed(["set", jail, cmdAdd, value])
+			self.assertEqual((ret[0], sorted(ret[1])), (0, sorted(values[:n+1])))
+			ret = self.transm.proceed(["get", jail, cmd])
+			self.assertEqual((ret[0], sorted(ret[1])), (0, sorted(values[:n+1])))
 		for n, value in enumerate(values):
-			self.assertEqual(
-				self.transm.proceed(["set", jail, cmdDel, value]),
-				(0, values[n+1:]))
-			self.assertEqual(
-				self.transm.proceed(["get", jail, cmd]),
-				(0, values[n+1:]))
+			ret = self.transm.proceed(["set", jail, cmdDel, value])
+			self.assertEqual((ret[0], sorted(ret[1])), (0, sorted(values[n+1:])))
+			ret = self.transm.proceed(["get", jail, cmd])
+			self.assertEqual((ret[0], sorted(ret[1])), (0, sorted(values[n+1:])))
 
 	def jailAddDelRegexTest(self, cmd, inValues, outValues, jail):
 		cmdAdd = "add" + cmd
@@ -137,6 +144,7 @@ class TransmitterBase(unittest.TestCase):
 				self.transm.proceed(["get", jail, cmd]),
 				(0, outValues[n+1:]))
 
+
 class Transmitter(TransmitterBase):
 
 	def setUp(self):
@@ -156,8 +164,9 @@ class Transmitter(TransmitterBase):
 		t0 = time.time()
 		self.assertEqual(self.transm.proceed(["sleep", "1"]), (0, None))
 		t1 = time.time()
-		# Approx 1 second delay
-		self.assertAlmostEqual(t1 - t0, 1, places=1)
+		# Approx 1 second delay but not faster
+		dt = t1 - t0
+		self.assertTrue(0.99 < dt < 1.1, msg="Sleep was %g sec" % dt)
 
 	def testDatabase(self):
 		tmp, tmpFilename = tempfile.mkstemp(".db", "fail2ban_")
@@ -165,8 +174,14 @@ class Transmitter(TransmitterBase):
 		self.setGetTestNOK("dbfile", tmpFilename)
 		self.server.delJail(self.jailName)
 		self.setGetTest("dbfile", tmpFilename)
+		# the same file name (again no jails / not changed):
+		self.setGetTest("dbfile", tmpFilename)
 		self.setGetTest("dbpurgeage", "600", 600)
 		self.setGetTestNOK("dbpurgeage", "LIZARD")
+		# the same file name (again with jails / not changed):
+		self.server.addJail(self.jailName, "auto")
+		self.setGetTest("dbfile", tmpFilename)
+		self.server.delJail(self.jailName)
 
 		# Disable database
 		self.assertEqual(self.transm.proceed(
@@ -180,6 +195,11 @@ class Transmitter(TransmitterBase):
 			(0, None))
 		self.assertEqual(self.transm.proceed(
 			["get", "dbpurgeage"]),
+			(0, None))
+		# the same (again with jails / not changed):
+		self.server.addJail(self.jailName, "auto")
+		self.assertEqual(self.transm.proceed(
+			["set", "dbfile", "None"]),
 			(0, None))
 		os.close(tmp)
 		os.unlink(tmpFilename)
@@ -208,7 +228,7 @@ class Transmitter(TransmitterBase):
 		time.sleep(1)
 		self.assertEqual(
 			self.transm.proceed(["stop", self.jailName]), (0, None))
-		self.assertTrue(self.jailName not in self.server._Server__jails)
+		self.assertNotIn(self.jailName, self.server._Server__jails)
 
 	def testStartStopAllJail(self):
 		self.server.addJail("TestJail2", "auto")
@@ -222,8 +242,8 @@ class Transmitter(TransmitterBase):
 		time.sleep(0.1)
 		self.assertEqual(self.transm.proceed(["stop", "all"]), (0, None))
 		time.sleep(1)
-		self.assertTrue(self.jailName not in self.server._Server__jails)
-		self.assertTrue("TestJail2" not in self.server._Server__jails)
+		self.assertNotIn(self.jailName, self.server._Server__jails)
+		self.assertNotIn("TestJail2", self.server._Server__jails)
 
 	def testJailIdle(self):
 		self.assertEqual(
@@ -474,6 +494,71 @@ class Transmitter(TransmitterBase):
 			)
 		)
 
+	def testJailStatusBasic(self):
+		self.assertEqual(self.transm.proceed(["status", self.jailName, "basic"]),
+			(0,
+				[
+					('Filter', [
+						('Currently failed', 0),
+						('Total failed', 0),
+						('File list', [])]
+					),
+					('Actions', [
+						('Currently banned', 0),
+						('Total banned', 0),
+						('Banned IP list', [])]
+					)
+				]
+			)
+		)
+
+	def testJailStatusBasicKwarg(self):
+		self.assertEqual(self.transm.proceed(["status", self.jailName, "INVALID"]),
+			(0,
+				[
+					('Filter', [
+						('Currently failed', 0),
+						('Total failed', 0),
+						('File list', [])]
+					),
+					('Actions', [
+						('Currently banned', 0),
+						('Total banned', 0),
+						('Banned IP list', [])]
+					)
+				]
+			)
+		)
+
+	def testJailStatusCymru(self):
+		try:
+			import dns.exception
+			import dns.resolver
+		except ImportError:
+			value = ['error']
+		else:
+			value = []
+
+		self.assertEqual(self.transm.proceed(["status", self.jailName, "cymru"]),
+			(0,
+				[
+					('Filter', [
+						('Currently failed', 0),
+						('Total failed', 0),
+						('File list', [])]
+					),
+					('Actions', [
+						('Currently banned', 0),
+						('Total banned', 0),
+						('Banned IP list', []),
+						('Banned ASN list', value),
+						('Banned Country list', value),
+						('Banned RIR list', value)]
+					)
+				]
+			)
+		)
+
 	def testAction(self):
 		action = "TestCaseAction"
 		cmdList = [
@@ -603,10 +688,7 @@ class Transmitter(TransmitterBase):
 
 	def testJournalMatch(self):
 		if not filtersystemd: # pragma: no cover
-			if sys.version_info >= (2, 7):
-				raise unittest.SkipTest(
-					"systemd python interface not available")
-			return
+			raise unittest.SkipTest("systemd python interface not available")
 		jailName = "TestJail2"
 		self.server.addJail(jailName, "systemd")
 		values = [
@@ -675,12 +757,14 @@ class Transmitter(TransmitterBase):
 			["set", jailName, "deljournalmatch", value])
 		self.assertTrue(isinstance(result[1], ValueError))
 
+
 class TransmitterLogging(TransmitterBase):
 
 	def setUp(self):
 		self.server = Server()
 		self.server.setLogTarget("/dev/null")
 		self.server.setLogLevel("CRITICAL")
+		self.server.setSyslogSocket("auto")
 		super(TransmitterLogging, self).setUp()
 
 	def testLogTarget(self):
@@ -704,11 +788,29 @@ class TransmitterLogging(TransmitterBase):
 		self.setGetTest("logtarget", "STDERR")
 
 	def testLogTargetSYSLOG(self):
-		if not os.path.exists("/dev/log") and sys.version_info >= (2, 7):
+		if not os.path.exists("/dev/log"):
 			raise unittest.SkipTest("'/dev/log' not present")
-		elif not os.path.exists("/dev/log"):
-			return
+		self.assertTrue(self.server.getSyslogSocket(), "auto")
 		self.setGetTest("logtarget", "SYSLOG")
+		self.assertTrue(self.server.getSyslogSocket(), "/dev/log")
+
+	def testSyslogSocket(self):
+		self.setGetTest("syslogsocket", "/dev/log/NEW/PATH")
+
+	def testSyslogSocketNOK(self):
+		self.setGetTest("syslogsocket", "/this/path/should/not/exist")
+		self.setGetTestNOK("logtarget", "SYSLOG")
+		# set back for other tests
+		self.setGetTest("syslogsocket", "/dev/log")
+		self.setGetTest("logtarget", "SYSLOG",
+			**{True: {},    # should work on Linux
+			   False: dict( # expect to fail otherwise
+				   outCode=1,
+				   outValue=Exception('Failed to change log target'),
+				   repr_=True # Exceptions are not comparable apparently
+                                  )
+			  }[platform.system() in ('Linux',) and os.path.exists('/dev/log')]
+		)
 
 	def testLogLevel(self):
 		self.setGetTest("loglevel", "HEAVYDEBUG")
@@ -778,6 +880,7 @@ class JailTests(unittest.TestCase):
 		jail = Jail(longname)
 		self.assertEqual(jail.name, longname)
 
+
 class RegexTests(unittest.TestCase):
 
 	def testInit(self):
@@ -802,9 +905,11 @@ class RegexTests(unittest.TestCase):
 		self.assertTrue(fr.hasMatched())
 		self.assertRaises(RegexException, fr.getHost)
 
+
 class _BadThread(JailThread):
 	def run(self):
-		int("ignore this exception -- raised for testing")
+		raise RuntimeError('run bad thread exception')
+
 
 class LoggingTests(LogCaptureTestCase):
 
@@ -814,7 +919,15 @@ class LoggingTests(LogCaptureTestCase):
 		self.assertEqual(testLogSys.name, "fail2ban.name")
 
 	def testFail2BanExceptHook(self):
-		badThread = _BadThread()
-		badThread.start()
-		badThread.join()
-		self.assertTrue(self._is_logged("Unhandled exception"))
+		prev_exchook = sys.__excepthook__
+		x = []
+		sys.__excepthook__ = lambda *args: x.append(args)
+		try:
+			badThread = _BadThread()
+			badThread.start()
+			badThread.join()
+			self.assertLogged("Unhandled exception")
+		finally:
+			sys.__excepthook__ = prev_exchook
+		self.assertEqual(len(x), 1)
+		self.assertEqual(x[0][0], RuntimeError)

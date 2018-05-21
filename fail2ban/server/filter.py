@@ -21,7 +21,13 @@ __author__ = "Cyril Jaquier and Fail2Ban Contributors"
 __copyright__ = "Copyright (c) 2004 Cyril Jaquier, 2011-2013 Yaroslav Halchenko"
 __license__ = "GPL"
 
-import re, os, fcntl, sys, locale, codecs
+import codecs
+import fcntl
+import locale
+import logging
+import os
+import re
+import sys
 
 from .failmanager import FailManagerEmpty, FailManager
 from .ticket import FailTicket
@@ -42,6 +48,7 @@ logSys = getLogger(__name__)
 # This class reads a log file and detects login failures or anything else
 # that matches a given regular expression. This class is instantiated by
 # a Jail object.
+
 
 class Filter(JailThread):
 
@@ -76,11 +83,12 @@ class Filter(JailThread):
 		self.__lastDate = None
 		## External command
 		self.__ignoreCommand = False
+		## Default or preferred encoding (to decode bytes from file or journal):
+		self.__encoding = locale.getpreferredencoding()
 
 		self.dateDetector = DateDetector()
 		self.dateDetector.addDefaultTemplate()
 		logSys.debug("Created %s" % self)
-
 
 	def __repr__(self):
 		return "%s(%r)" % (self.__class__.__name__, self.jail)
@@ -100,10 +108,9 @@ class Filter(JailThread):
 				logSys.warning(
 					"Mutliline regex set for jail '%s' "
 					"but maxlines not greater than 1")
-		except RegexException, e:
+		except RegexException as e:
 			logSys.error(e)
 			raise e
-
 
 	def delFailRegex(self, index):
 		try:
@@ -134,7 +141,7 @@ class Filter(JailThread):
 		try:
 			regex = Regex(value)
 			self.__ignoreRegex.append(regex)
-		except RegexException, e:
+		except RegexException as e:
 			logSys.error(e)
 			raise e 
 
@@ -164,7 +171,7 @@ class Filter(JailThread):
 		if isinstance(value, bool):
 			value = {True: 'yes', False: 'no'}[value]
 		value = value.lower()			  # must be a string by now
-		if not (value in ('yes', 'no', 'warn')):
+		if not (value in ('yes', 'warn', 'no', 'raw')):
 			logSys.error("Incorrect value %r specified for usedns. "
 						 "Using safe 'no'" % (value,))
 			value = 'no'
@@ -276,6 +283,27 @@ class Filter(JailThread):
 		return self.__lineBufferSize
 
 	##
+	# Set the log file encoding
+	#
+	# @param encoding the encoding used with log files
+
+	def setLogEncoding(self, encoding):
+		if encoding.lower() == "auto":
+			encoding = locale.getpreferredencoding()
+		codecs.lookup(encoding) # Raise LookupError if invalid codec
+		self.__encoding = encoding
+		logSys.info("Set jail log file encoding to %s" % encoding)
+		return encoding
+
+	##
+	# Get the log file encoding
+	#
+	# @return log encoding value
+
+	def getLogEncoding(self):
+		return self.__encoding
+
+	##
 	# Main loop.
 	#
 	# This function is the main loop of the thread. It checks if the
@@ -338,6 +366,10 @@ class Filter(JailThread):
 		logSys.debug("Remove " + ip + " from ignore list")
 		self.__ignoreIpList.remove(ip)
 
+	def logIgnoreIp(self, ip, log_ignore, ignore_source="unknown source"):
+		if log_ignore:
+			logSys.info("[%s] Ignore %s by %s" % (self.jail.name, ip, ignore_source))
+
 	def getIgnoreIP(self):
 		return self.__ignoreIpList
 
@@ -349,7 +381,7 @@ class Filter(JailThread):
 	# @param ip IP address
 	# @return True if IP address is in ignore list
 
-	def inIgnoreIPList(self, ip):
+	def inIgnoreIPList(self, ip, log_ignore=False):
 		for i in self.__ignoreIpList:
 			# An empty string is always false
 			if i == "":
@@ -363,28 +395,54 @@ class Filter(JailThread):
 					"(?<=b)1+", bin(DNSUtils.addr2bin(s[1]))).group())
 			s[1] = long(s[1])
 			try:
-				a = DNSUtils.cidr(s[0], s[1])
-				b = DNSUtils.cidr(ip, s[1])
+				a = DNSUtils.addr2bin(s[0], cidr=s[1])
+				b = DNSUtils.addr2bin(ip, cidr=s[1])
 			except Exception:
 				# Check if IP in DNS
 				ips = DNSUtils.dnsToIp(i)
 				if ip in ips:
+					self.logIgnoreIp(ip, log_ignore, ignore_source="dns")
 					return True
 				else:
 					continue
 			if a == b:
+				self.logIgnoreIp(ip, log_ignore, ignore_source="ip")
 				return True
 
 		if self.__ignoreCommand:
 			command = CommandAction.replaceTag(self.__ignoreCommand, { 'ip': ip } )
 			logSys.debug('ignore command: ' + command)
-			return CommandAction.executeCmd(command)
+			ret_ignore = CommandAction.executeCmd(command)
+			self.logIgnoreIp(ip, log_ignore and ret_ignore, ignore_source="command")
+			return ret_ignore
 
 		return False
 
+	if sys.version_info >= (3,):
+		@staticmethod
+		def uni_decode(x, enc, errors='strict'):
+			try:
+				if isinstance(x, bytes):
+					return x.decode(enc, errors)
+				return x
+			except (UnicodeDecodeError, UnicodeEncodeError): # pragma: no cover - unsure if reachable
+				if errors != 'strict': 
+					raise
+				return uni_decode(x, enc, 'replace')
+	else:
+		@staticmethod
+		def uni_decode(x, enc, errors='strict'):
+			try:
+				if isinstance(x, unicode):
+					return x.encode(enc, errors)
+				return x
+			except (UnicodeDecodeError, UnicodeEncodeError): # pragma: no cover - unsure if reachable
+				if errors != 'strict':
+					raise
+				return uni_decode(x, enc, 'replace')
 
 	def processLine(self, line, date=None, returnRawHost=False,
-		checkAllRegex=False):
+		checkAllRegex=False, checkFindTime=False):
 		"""Split the time portion from log msg and return findFailures on them
 		"""
 		if date:
@@ -403,23 +461,18 @@ class Filter(JailThread):
 				tupleLine = (l, "", "")
 
 		return "".join(tupleLine[::2]), self.findFailure(
-			tupleLine, date, returnRawHost, checkAllRegex)
+			tupleLine, date, returnRawHost, checkAllRegex, checkFindTime)
 
 	def processLineAndAdd(self, line, date=None):
 		"""Processes the line for failures and populates failManager
 		"""
-		for element in self.processLine(line, date)[1]:
+		for element in self.processLine(line, date, checkFindTime=True)[1]:
 			ip = element[1]
 			unixTime = element[2]
 			lines = element[3]
 			logSys.debug("Processing line with time:%s and ip:%s"
 						 % (unixTime, ip))
-			if unixTime < MyTime.time() - self.getFindTime():
-				logSys.debug("Ignore line since time %s < %s - %s"
-							 % (unixTime, MyTime.time(), self.getFindTime()))
-				break
-			if self.inIgnoreIPList(ip):
-				logSys.info("[%s] Ignore %s" % (self.jail.name, ip))
+			if self.inIgnoreIPList(ip, log_ignore=True):
 				continue
 			logSys.info("[%s] Found %s" % (self.jail.name, ip))
 			## print "D: Adding a ticket for %s" % ((ip, unixTime, [line]),)
@@ -447,7 +500,7 @@ class Filter(JailThread):
 	# @return a dict with IP and timestamp.
 
 	def findFailure(self, tupleLine, date=None, returnRawHost=False,
-		checkAllRegex=False):
+		checkAllRegex=False, checkFindTime=False):
 		failList = list()
 
 		# Checks if we must ignore this line.
@@ -479,8 +532,14 @@ class Filter(JailThread):
 			timeText = self.__lastTimeText or "".join(tupleLine[::2])
 			date = self.__lastDate
 
+		if checkFindTime and date is not None and date < MyTime.time() - self.getFindTime():
+			logSys.log(5, "Ignore line since time %s < %s - %s", 
+				date, MyTime.time(), self.getFindTime())
+			return failList
+
 		self.__lineBuffer = (
 			self.__lineBuffer + [tupleLine])[-self.__lineBufferSize:]
+		logSys.log(5, "Looking for failregex match of %r" % self.__lineBuffer)
 
 		# Iterates over all the regular expressions.
 		for failRegexIndex, failRegex in enumerate(self.__failRegex):
@@ -512,7 +571,7 @@ class Filter(JailThread):
 					self.__lineBuffer = failRegex.getUnmatchedTupleLines()
 					try:
 						host = failRegex.getHost()
-						if returnRawHost:
+						if returnRawHost or self.__useDns == "raw":
 							failList.append([failRegexIndex, host, date,
 								 failRegex.getMatchedLines()])
 							if not checkAllRegex:
@@ -525,12 +584,11 @@ class Filter(JailThread):
 										 failRegex.getMatchedLines()])
 								if not checkAllRegex:
 									break
-					except RegexException, e: # pragma: no cover - unsure if reachable
+					except RegexException as e: # pragma: no cover - unsure if reachable
 						logSys.error(e)
 		return failList
 
-	@property
-	def status(self):
+	def status(self, flavor="basic"):
 		"""Status of failures detected by filter.
 		"""
 		ret = [("Currently failed", self.failManager.size()),
@@ -543,25 +601,24 @@ class FileFilter(Filter):
 	def __init__(self, jail, **kwargs):
 		Filter.__init__(self, jail, **kwargs)
 		## The log file path.
-		self.__logPath = []
-		self.setLogEncoding("auto")
+		self.__logs = dict()
 
 	##
 	# Add a log file path
 	#
 	# @param path log file path
 
-	def addLogPath(self, path, tail = False):
-		if self.containsLogPath(path):
+	def addLogPath(self, path, tail=False):
+		if path in self.__logs:
 			logSys.error(path + " already exists")
 		else:
-			container = FileContainer(path, self.getLogEncoding(), tail)
+			log = FileContainer(path, self.getLogEncoding(), tail)
 			db = self.jail.database
 			if db is not None:
-				lastpos = db.addLog(self.jail, container)
+				lastpos = db.addLog(self.jail, log)
 				if lastpos and not tail:
-					container.setPos(lastpos)
-			self.__logPath.append(container)
+					log.setPos(lastpos)
+			self.__logs[path] = log
 			logSys.info("Added logfile = %s" % path)
 			self._addLogPath(path)			# backend specific
 
@@ -570,22 +627,22 @@ class FileFilter(Filter):
 		# to be overridden by backends
 		pass
 
-
 	##
 	# Delete a log path
 	#
 	# @param path the log file to delete
 
 	def delLogPath(self, path):
-		for log in self.__logPath:
-			if log.getFileName() == path:
-				self.__logPath.remove(log)
-				db = self.jail.database
-				if db is not None:
-					db.updateLog(self.jail, log)
-				logSys.info("Removed logfile = %s" % path)
-				self._delLogPath(path)
-				return
+		try:
+			log = self.__logs.pop(path)
+		except KeyError:
+			return
+		db = self.jail.database
+		if db is not None:
+			db.updateLog(self.jail, log)
+		logSys.info("Removed logfile = %s" % path)
+		self._delLogPath(path)
+		return
 
 	def _delLogPath(self, path): # pragma: no cover - overwritten function
 		# nothing to do by default
@@ -593,12 +650,12 @@ class FileFilter(Filter):
 		pass
 
 	##
-	# Get the log file path
+	# Get the log containers
 	#
-	# @return log file path
+	# @return log containers
 
-	def getLogPath(self):
-		return self.__logPath
+	def getLogs(self):
+		return self.__logs.values()
 
 	##
 	# Check whether path is already monitored.
@@ -607,10 +664,7 @@ class FileFilter(Filter):
 	# @return True if the path is already monitored else False
 
 	def containsLogPath(self, path):
-		for log in self.__logPath:
-			if log.getFileName() == path:
-				return True
-		return False
+		return path in self.__logs
 
 	##
 	# Set the log file encoding
@@ -618,27 +672,12 @@ class FileFilter(Filter):
 	# @param encoding the encoding used with log files
 
 	def setLogEncoding(self, encoding):
-		if encoding.lower() == "auto":
-			encoding = locale.getpreferredencoding()
-		codecs.lookup(encoding) # Raise LookupError if invalid codec
-		for log in self.getLogPath():
+		encoding = super(FileFilter, self).setLogEncoding(encoding)
+		for log in self.__logs.itervalues():
 			log.setEncoding(encoding)
-		self.__encoding = encoding
-		logSys.info("Set jail log file encoding to %s" % encoding)
 
-	##
-	# Get the log file encoding
-	#
-	# @return log encoding value
-
-	def getLogEncoding(self):
-		return self.__encoding
-
-	def getFileContainer(self, path):
-		for log in self.__logPath:
-			if log.getFileName() == path:
-				return log
-		return None
+	def getLog(self, path):
+		return self.__logs.get(path, None)
 
 	##
 	# Gets all the failure in the log file.
@@ -648,23 +687,23 @@ class FileFilter(Filter):
 	# is created and is added to the FailManager.
 
 	def getFailures(self, filename):
-		container = self.getFileContainer(filename)
-		if container is None:
+		log = self.getLog(filename)
+		if log is None:
 			logSys.error("Unable to get failures in " + filename)
 			return False
 		# Try to open log file.
 		try:
-			has_content = container.open()
+			has_content = log.open()
 		# see http://python.org/dev/peps/pep-3151/
-		except IOError, e:
+		except IOError as e:
 			logSys.error("Unable to open %s" % filename)
 			logSys.exception(e)
 			return False
-		except OSError, e: # pragma: no cover - requires race condition to tigger this
+		except OSError as e: # pragma: no cover - requires race condition to tigger this
 			logSys.error("Error opening %s" % filename)
 			logSys.exception(e)
 			return False
-		except OSError, e: # pragma: no cover - Requires implemention error in FileContainer to generate
+		except Exception as e: # pragma: no cover - Requires implemention error in FileContainer to generate
 			logSys.error("Internal errror in FileContainer open method - please report as a bug to https://github.com/fail2ban/fail2ban/issues")
 			logSys.exception(e)
 			return False
@@ -675,23 +714,22 @@ class FileFilter(Filter):
 		# start reading tested to be empty container -- race condition
 		# might occur leading at least to tests failures.
 		while has_content:
-			line = container.readline()
+			line = log.readline()
 			if not line or not self.active:
 				# The jail reached the bottom or has been stopped
 				break
 			self.processLineAndAdd(line)
-		container.close()
+		log.close()
 		db = self.jail.database
 		if db is not None:
-			db.updateLog(self.jail, container)
+			db.updateLog(self.jail, log)
 		return True
 
-	@property
-	def status(self):
+	def status(self, flavor="basic"):
 		"""Status of Filter plus files being monitored.
 		"""
-		ret = super(FileFilter, self).status
-		path = [m.getFileName() for m in self.getLogPath()]
+		ret = super(FileFilter, self).status(flavor=flavor)
+		path = self.__logs.keys()
 		ret.append(("File list", path))
 		return ret
 
@@ -704,12 +742,18 @@ class FileFilter(Filter):
 
 try:
 	import hashlib
-	md5sum = hashlib.md5
+	try:
+		md5sum = hashlib.md5
+		# try to use it (several standards like FIPS forbid it):
+		md5sum(' ').hexdigest()
+	except: # pragma: no cover
+		md5sum = hashlib.sha1
 except ImportError: # pragma: no cover
 	# hashlib was introduced in Python 2.5.  For compatibility with those
 	# elderly Pythons, import from md5
 	import md5
 	md5sum = md5.new
+
 
 class FileContainer:
 
@@ -776,7 +820,7 @@ class FileContainer:
 		## sys.stdout.flush()
 		# Compare hash and inode
 		if self.__hash != myHash or self.__ino != stats.st_ino:
-			logSys.info("Log rotation detected for %s" % self.__filename)
+			logSys.log(logging.MSG, "Log rotation detected for %s" % self.__filename)
 			self.__hash = myHash
 			self.__ino = stats.st_ino
 			self.__pos = 0
@@ -784,20 +828,31 @@ class FileContainer:
 		self.__handler.seek(self.__pos)
 		return True
 
+	@staticmethod
+	def decode_line(filename, enc, line):
+		try:
+			return line.decode(enc, 'strict')
+		except (UnicodeDecodeError, UnicodeEncodeError) as e:
+			global _decode_line_warn
+			lev = logging.DEBUG
+			if _decode_line_warn.get(filename, 0) <= MyTime.time():
+				lev = logging.WARNING
+				_decode_line_warn[filename] = MyTime.time() + 24*60*60
+			logSys.log(lev,
+				"Error decoding line from '%s' with '%s'."
+				" Consider setting logencoding=utf-8 (or another appropriate"
+				" encoding) for this jail. Continuing"
+				" to process line ignoring invalid characters: %r",
+				filename, enc, line)
+			# decode with replacing error chars:
+			line = line.decode(enc, 'replace')
+		return line
+
 	def readline(self):
 		if self.__handler is None:
 			return ""
-		line = self.__handler.readline()
-		try:
-			line = line.decode(self.getEncoding(), 'strict')
-		except UnicodeDecodeError:
-			logSys.warning(
-				"Error decoding line from '%s' with '%s'. Continuing "
-				" to process line ignoring invalid characters: %r" %
-				(self.getFileName(), self.getEncoding(), line))
-			if sys.version_info >= (3,): # In python3, must be decoded
-				line = line.decode(self.getEncoding(), 'ignore')
-		return line
+		return FileContainer.decode_line(
+			self.getFileName(), self.getEncoding(), self.__handler.readline())
 
 	def close(self):
 		if not self.__handler is None:
@@ -808,6 +863,8 @@ class FileContainer:
 			self.__handler = None
 		## print "D: Closed %s with pos %d" % (handler, self.__pos)
 		## sys.stdout.flush()
+
+_decode_line_warn = {}
 
 
 ##
@@ -832,30 +889,40 @@ class JournalFilter(Filter): # pragma: systemd no cover
 # This class contains only static methods used to handle DNS and IP
 # addresses.
 
-import socket, struct
+import socket
+import struct
+
 
 class DNSUtils:
 
 	IP_CRE = re.compile("^(?:\d{1,3}\.){3}\d{1,3}$")
 
-	#@staticmethod
+	@staticmethod
 	def dnsToIp(dns):
 		""" Convert a DNS into an IP address using the Python socket module.
 			Thanks to Kevin Drapel.
 		"""
+		# retrieve ip (todo: use AF_INET6 for IPv6)
 		try:
-			return set(socket.gethostbyname_ex(dns)[2])
-		except socket.error, e:
+			return set([i[4][0] for i in socket.getaddrinfo(dns, None, socket.AF_INET, 0, socket.IPPROTO_TCP)])
+		except socket.error as e:
 			logSys.warning("Unable to find a corresponding IP address for %s: %s"
 						% (dns, e))
 			return list()
-		except socket.error, e:
+		except socket.error as e:
 			logSys.warning("Socket error raised trying to resolve hostname %s: %s"
 						% (dns, e))
 			return list()
-	dnsToIp = staticmethod(dnsToIp)
 
-	#@staticmethod
+	@staticmethod
+	def ipToName(ip):
+		try:
+			return socket.gethostbyaddr(ip)[0]
+		except socket.error as e:
+			logSys.debug("Unable to find a name for the IP %s: %s" % (ip, e))
+			return None
+
+	@staticmethod
 	def searchIP(text):
 		""" Search if an IP address if directly available and return
 			it.
@@ -865,9 +932,8 @@ class DNSUtils:
 			return match
 		else:
 			return None
-	searchIP = staticmethod(searchIP)
 
-	#@staticmethod
+	@staticmethod
 	def isValidIP(string):
 		""" Return true if str is a valid IP
 		"""
@@ -877,9 +943,8 @@ class DNSUtils:
 			return True
 		except socket.error:
 			return False
-	isValidIP = staticmethod(isValidIP)
 
-	#@staticmethod
+	@staticmethod
 	def textToIp(text, useDns):
 		""" Return the IP of DNS found in a given text.
 		"""
@@ -901,28 +966,20 @@ class DNSUtils:
 					text, ipList)
 
 		return ipList
-	textToIp = staticmethod(textToIp)
 
-	#@staticmethod
-	def cidr(i, n):
-		""" Convert an IP address string with a CIDR mask into a 32-bit
-			integer.
+	@staticmethod
+	def addr2bin(ipstring, cidr=None):
+		""" Convert a string IPv4 address into binary form.
+		If cidr is supplied, return the network address for the given block
 		"""
-		# 32-bit IPv4 address mask
-		MASK = 0xFFFFFFFFL
-		return ~(MASK >> n) & MASK & DNSUtils.addr2bin(i)
-	cidr = staticmethod(cidr)
+		if cidr is None:
+			return struct.unpack("!L", socket.inet_aton(ipstring))[0]
+		else:
+			MASK = 0xFFFFFFFFL
+			return ~(MASK >> cidr) & MASK & DNSUtils.addr2bin(ipstring)
 
-	#@staticmethod
-	def addr2bin(string):
-		""" Convert a string IPv4 address into an unsigned integer.
+	@staticmethod
+	def bin2addr(ipbin):
+		""" Convert a binary IPv4 address into string n.n.n.n form.
 		"""
-		return struct.unpack("!L", socket.inet_aton(string))[0]
-	addr2bin = staticmethod(addr2bin)
-
-	#@staticmethod
-	def bin2addr(addr):
-		""" Convert a numeric IPv4 address into string n.n.n.n form.
-		"""
-		return socket.inet_ntoa(struct.pack("!L", addr))
-	bin2addr = staticmethod(bin2addr)
+		return socket.inet_ntoa(struct.pack("!L", ipbin))
